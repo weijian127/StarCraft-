@@ -1,4 +1,7 @@
 .venv/
+.tools/
+.pytest_cache/
+runs/
 __pycache__/
 #data/
 .env
