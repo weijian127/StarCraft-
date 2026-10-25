@@ -170,8 +170,8 @@ to avoid overflow. Sampling uses PyTorch's RNG, including automatic worker
 seeding. Reset `torch.manual_seed` for repeatable runs without workers, or use
 a freshly seeded DataLoader generator with workers. Repeated evaluation without
 resetting the RNG samples new frames; fix the seed/loader for comparable metrics.
-These fraction-of-replay windows reproduce the baseline convention; a future
-elapsed-time prediction loader must restrict observations to its cutoff.
+These fraction-of-replay windows reproduce the baseline convention. Use the
+elapsed-time loader described below for predictions restricted to a cutoff.
 
 ## Baek model and training
 
@@ -262,8 +262,113 @@ with torch.no_grad():
     terran_win_probability = logits.softmax(dim=-1)[:, 1]
 ```
 
-Training restart/resume and Grad-CAM are not implemented in this initial loop.
+The original baseline entry point stays available for reference comparisons.
+The temporal trainer below adds restart/resume, cutoff metrics, and Grad-CAM.
 The 11-match set is for pipeline verification; its validation scores cannot
 establish reproduction of the paper's reported predictive performance.
 
 Run checks with `uv run --extra cuda python -m pytest -q` (omit the extra on CPU).
+
+## Elapsed-time prediction and explanations
+
+Three proposal gaps are implemented using the available arrays:
+
+1. **Predictions from observed prefixes.** `data_processing.temporal.PrefixReplayDataset`
+   selects 50 distinct frames at fixed elapsed cutoffs (60, 120, ... 1200 seconds
+   by default). It uses only timestamps at or before the cutoff, always includes
+   the latest observation, and excludes cutoffs at/after the terminal observation.
+   Sampling never uses a fraction of the final replay length. Training samples
+   earlier frames randomly with logarithmic weighting; evaluation uses fixed,
+   evenly spaced indices. Each example preserves exact frame indices/times and
+   match/POV identity. `--history-seconds 0` uses the full observed prefix; a
+   positive value restricts the window to that many seconds before the cutoff.
+2. **Win-probability timelines and pivotal intervals.** Deterministic predictions
+   produce P(Terran wins) at each cutoff. Adjacent changes of at least ten
+   percentage points mark candidate pivotal intervals; nearby intervals merge.
+   These are model-detected changes, not proven causal events or action advice.
+3. **Gradient-based visual evidence.** Grad-CAM differentiates the target-class
+   logit margin through the post-attention feature volume. Positive evidence is
+   upsampled onto observed minimap frames. The export includes a probability
+   timeline, an offline HTML inspector, PNG overlays, complete heatmap arrays,
+   timestamps, and a top-attribution-versus-random masking diagnostic.
+
+Run a short end-to-end trial:
+
+```powershell
+.\.venv\Scripts\python.exe -u -m training.train_temporal --epochs 2 --device cuda --cache-samples 24 --output runs/prefix-trial --review-on-finish
+```
+
+Run a five-hour development experiment:
+
+```powershell
+.\.venv\Scripts\python.exe -u -m training.train_temporal --epochs 100000 --max-hours 5 --device cuda --cache-samples 24 --output runs/prefix-5h --keep-awake --review-on-finish
+```
+
+The budget starts after setup and is checked at epoch boundaries, so training
+can exceed it by one epoch; final explanation export takes additional time.
+`--keep-awake` temporarily prevents automatic Windows sleep while the process
+runs, without changing system power settings. Keep the laptop powered and awake;
+the flag does not override a manual shutdown or hibernation. The decoded arrays
+for the current corpus occupy approximately 2.9 GiB; `--cache-samples 24` keeps
+them in RAM. The default cache limit is two recordings per dataset.
+
+Temporal training retains the Baek architecture and uses Adam at 0.0001, batch
+size two, and CUDA mixed precision. Match-grouped, outcome-stratified splits keep
+both player POVs and all prefixes of each match together. With the default seed
+and current corpus, the split has 158 training prefixes from nine matches and
+80 validation prefixes from two matches. Longer recordings contribute more
+prefixes; aggregate metrics weight prefixes equally, not matches equally.
+
+The output directory contains:
+
+- `config.json`: settings, code revision, process ID, and exact split match IDs.
+- `history.json`: train/validation loss, accuracy, Brier score, confusion matrix,
+  and counts overall and at each elapsed cutoff; successful/skipped AMP optimizer
+  steps; epoch runtime and CUDA peak allocated/reserved bytes. Epoch timing
+  includes loading, training, and validation, but excludes checkpoint writing.
+- `status.json`: current state, last completed epoch, elapsed time, and metrics.
+- `best.pt`: lowest validation Brier score checkpoint, saved on improvement.
+- `last.pt`: recovery checkpoint every five epochs, after the first epoch, and
+  at normal completion. `--checkpoint-every 1` saves every epoch. Model, Adam,
+  AMP, CPU/CUDA RNG, and training-loader RNG states are preserved.
+- `review/`: explanation export from the selected best checkpoint when
+  `--review-on-finish` is enabled.
+
+To stop cleanly after the current epoch, create an empty `STOP` file in the run
+directory. A failure or forced termination can lose work since `last.pt`.
+Resume into a new directory with the same data, sampling, batch-size, learning
+rate, and AMP settings (`--epochs` is the total desired epoch count):
+
+```powershell
+New-Item -ItemType File runs/prefix-5h/STOP
+.\.venv\Scripts\python.exe -u -m training.train_temporal --resume runs/prefix-5h/last.pt --epochs 100000 --max-hours 5 --device cuda --cache-samples 24 --output runs/prefix-resumed --keep-awake --review-on-finish
+```
+
+Keep `best.pt` beside the source recovery checkpoint; it is copied into the new
+run and its selection score is retained, even if newer than `last.pt`. A resumed
+run's time budget starts fresh. Recovery restores RNG state, but GPU kernels
+are not forced deterministic, so bitwise GPU reproducibility is not promised.
+
+Export another held-out POV or change interval settings without retraining:
+
+```powershell
+.\.venv\Scripts\python.exe -m analysis.review --checkpoint runs/prefix-5h/best.pt --output runs/another-review --device cuda --threshold 0.1 --merge-seconds 60
+```
+
+Use `--sample-id` to select an eligible validation POV. The default is the first
+validation sample. The exporter explains up to two intervals with the largest
+changes, or the last cutoff when no change exceeds the threshold. Heatmaps are
+normalized per clip and interpolated from a coarse 3D volume; they are not
+pixel-precise causal explanations. The masking check zeros the same 10% of
+spatiotemporal cells across all categorical channels and compares probability
+changes with an equally sized seeded random mask. This can create unrealistic
+inputs, so the result is a sensitivity diagnostic rather than a faithfulness
+guarantee. An all-zero Grad-CAM map is reported as unavailable for masking.
+
+Still outstanding from the proposal: global-state data, resources/counts/upgrades
+and action histories, scalar/spatial fusion, action integrated gradients and
+action annotations, broader held-out/k-fold evaluation, calibration, and human
+review. The current arrays are separate **fog-limited player views**. Validation
+is used for checkpoint selection and is not an independent final test. A long
+run on eleven matches validates operation and exposes overfitting; it cannot
+establish generalization or reproduce the paper's benchmark accuracy.
