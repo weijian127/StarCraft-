@@ -3,6 +3,7 @@
 import argparse
 import html
 import json
+import math
 from pathlib import Path
 
 import matplotlib
@@ -52,7 +53,29 @@ def masking_check(model, inputs, heatmap, *, target_class=1, fraction=0.1, seed=
             "random_probability_drop": before - masked_probabilities[1], "random_seed": seed}
 
 
-def build_review(checkpoint_path, output, *, device="auto", sample_id=None, threshold=0.1, merge_seconds=60):
+def time_grid_settings(config, *, min_seconds=None, step_seconds=None, max_seconds=None):
+    """Return the training grid, the inference grid and whether they differ.
+
+    An override changes only which cutoffs the exporter samples. The checkpoint and
+    its recorded training settings are read, never rewritten.
+    """
+    training = {"min_seconds": float(config["min_seconds"]),
+                "step_seconds": float(config["step_seconds"]),
+                "max_seconds": float(config["max_seconds"])}
+    inference = dict(training)
+    for name, value in (("min_seconds", min_seconds), ("step_seconds", step_seconds),
+                        ("max_seconds", max_seconds)):
+        if value is not None:
+            inference[name] = float(value)
+    if (not all(math.isfinite(value) for value in inference.values())
+            or inference["min_seconds"] < 0 or inference["step_seconds"] <= 0
+            or inference["max_seconds"] < inference["min_seconds"]):
+        raise ValueError("Invalid inference time grid")
+    return training, inference, inference != training
+
+
+def build_review(checkpoint_path, output, *, device="auto", sample_id=None, threshold=0.1,
+                 merge_seconds=60, min_seconds=None, step_seconds=None, max_seconds=None):
     checkpoint_path, output = Path(checkpoint_path), Path(output)
     device = choose_device(device)
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
@@ -60,19 +83,46 @@ def build_review(checkpoint_path, output, *, device="auto", sample_id=None, thre
     if "min_seconds" not in config:
         raise ValueError("A cutoff-trained temporal checkpoint is required")
     model = load_model(checkpoint_path, device)
+    training_grid, inference_grid, grid_overridden = time_grid_settings(
+        config, min_seconds=min_seconds, step_seconds=step_seconds, max_seconds=max_seconds)
+    dataset_kwargs = dict(pov=config["pov"], split="test", frames=config["frames"],
+                          history_seconds=config["history_seconds"], seed=config["seed"],
+                          test_fraction=config["test_fraction"], cache_samples=1)
+    # Rebuild the checkpoint's own grid first, so the validation-match check keeps
+    # exactly its original meaning no matter what export grid is requested.
     dataset = PrefixReplayDataset(
-        config["root"], pov=config["pov"], split="test", frames=config["frames"],
-        min_seconds=config["min_seconds"], step_seconds=config["step_seconds"],
-        max_seconds=config["max_seconds"], history_seconds=config["history_seconds"],
-        seed=config["seed"], test_fraction=config["test_fraction"], cache_samples=1,
+        config["root"], min_seconds=training_grid["min_seconds"],
+        step_seconds=training_grid["step_seconds"], max_seconds=training_grid["max_seconds"],
+        **dataset_kwargs,
     )
     if sorted(dataset.replay_ids) != config["val_match_ids"]:
         raise ValueError("Review dataset does not match the checkpoint's validation matches")
-    sample_id = sample_id or dataset.samples[0]["sample_id"]
+    verification = dataset
+    # Rebuild with the export grid when one was requested. Match grouping, the
+    # held-out split and the terminal-observation exclusion are unchanged.
+    if grid_overridden:
+        dataset = PrefixReplayDataset(
+            config["root"], min_seconds=inference_grid["min_seconds"],
+            step_seconds=inference_grid["step_seconds"], max_seconds=inference_grid["max_seconds"],
+            **dataset_kwargs,
+        )
+        if not set(dataset.replay_ids) <= set(config["val_match_ids"]):
+            raise ValueError("Inference time grid changed the held-out match set")
+    if sample_id is None:
+        default_sample = verification.samples[0]["sample_id"]
+        if default_sample in {row["sample_id"] for row in dataset.samples}:
+            sample_id = default_sample
+        else:
+            sample_id = dataset.samples[0]["sample_id"]
+            print(f"Default sample {default_sample} has no eligible cutoff in the inference grid; "
+                  f"using {sample_id} instead.", flush=True)
     selected = [index for index, (base_index, _) in enumerate(dataset.examples)
                 if dataset.base.samples[base_index]["sample_id"] == sample_id]
     if not selected:
-        raise ValueError("sample_id must identify an eligible held-out POV")
+        raise ValueError(
+            "sample_id must identify an eligible held-out POV for the inference grid "
+            f"{inference_grid['min_seconds']:g}-{inference_grid['max_seconds']:g}s "
+            f"(step {inference_grid['step_seconds']:g}s)")
     output.mkdir(parents=True, exist_ok=False)
     points = []
     with torch.no_grad():
@@ -125,10 +175,19 @@ def build_review(checkpoint_path, output, *, device="auto", sample_id=None, thre
     report = {"sample_id": sample_id, "replay_id": first["replay_id"], "focus_player_id": first["focus_player_id"],
               "label": int(first["targets"]), "checkpoint": str(checkpoint_path.resolve()), "checkpoint_epoch": checkpoint["epoch"],
               "observation_setting": config["observation_setting"], "threshold": threshold, "merge_seconds": merge_seconds,
+              "time_grid": {"training": training_grid, "inference": inference_grid,
+                            "override_applied": bool(grid_overridden), "frames": int(config["frames"])},
               "points": points, "pivotal_intervals": intervals, "explanations": explanations,
-              "limitations": "Validation match used for model selection. Eleven-match development corpus; probabilities are uncalibrated. "
-              "Heatmaps show model evidence, not causal effects. Temporal/spatial heatmaps are interpolated from coarse encoder features. "
-              "Recorded actions are not present in these arrays."}
+              "limitations": (
+                  "Validation match used for model selection. Eleven-match development corpus; probabilities are uncalibrated. "
+                  "Heatmaps show model evidence, not causal effects. Temporal/spatial heatmaps are interpolated from coarse encoder features. "
+                  "Recorded actions are not present in these arrays. "
+                  f"This checkpoint was trained for {checkpoint['epoch']} epoch(s) and cutoffs "
+                  f"{training_grid['min_seconds']:g}-{training_grid['max_seconds']:g}s "
+                  f"(step {training_grid['step_seconds']:g}s). "
+                  + ("Other cutoffs are exported for pipeline testing only; predictive ability at those "
+                     "times is not validated." if grid_overridden else "")
+              )}
     write_json(output / "review.json", report)
     fig, axis = plt.subplots(figsize=(10, 4), constrained_layout=True)
     axis.plot([p["cutoff_seconds"] / 60 for p in points], [p["terran_win_probability"] for p in points], "o-", color="#287c8e")
@@ -173,9 +232,17 @@ def main():
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--threshold", type=float, default=0.1)
     parser.add_argument("--merge-seconds", type=float, default=60)
+    parser.add_argument("--min-seconds", type=float,
+                        help="Export-only cutoff grid: first cutoff (default: checkpoint value)")
+    parser.add_argument("--step-seconds", type=float,
+                        help="Export-only cutoff grid: spacing (default: checkpoint value)")
+    parser.add_argument("--max-seconds", type=float,
+                        help="Export-only cutoff grid: last cutoff (default: checkpoint value)")
     args = parser.parse_args()
     build_review(args.checkpoint, args.output, device=args.device, sample_id=args.sample_id,
-                 threshold=args.threshold, merge_seconds=args.merge_seconds)
+                 threshold=args.threshold, merge_seconds=args.merge_seconds,
+                 min_seconds=args.min_seconds, step_seconds=args.step_seconds,
+                 max_seconds=args.max_seconds)
 
 
 if __name__ == "__main__":

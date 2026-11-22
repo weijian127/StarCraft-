@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>SC2 replay review</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to main content</a>
+
+<div id="demo-banner" class="banner banner-demo" role="note" hidden>
+  <p><strong>DEMO DATA</strong> &mdash; the numbers and heatmaps on this page are synthetic values for interface testing only. They are <strong>not</strong> model predictions and do <strong>not</strong> describe a real match.</p>
+</div>
+
+<header class="page-header">
+  <h1>SC2 replay review</h1>
+  <p class="subtitle">Terran win probability over elapsed time, pivotal intervals, and Grad-CAM evidence.</p>
+</header>
+
+<div id="banner" class="banner" role="status" hidden></div>
+
+<main id="main">
+
+  <section id="help-panel" class="card" hidden aria-labelledby="help-heading">
+    <h2 id="help-heading">No review data loaded</h2>
+    <p id="help-message"></p>
+    <p id="help-detail" class="note"></p>
+    <p id="help-hint" class="note"></p>
+    <h3>How to load a review</h3>
+    <ol class="steps">
+      <li>Start a local server in the project root: <code>python -m http.server 8000 --bind 127.0.0.1</code></li>
+      <li>Open <code>http://127.0.0.1:8000/ui/index.html?review=&lt;directory&gt;</code></li>
+      <li>The <code>review</code> path is resolved from the server root, so <code>runs/my-run/review</code> works without a leading slash.</li>
+    </ol>
+    <p class="note">Demo directory: <code>http://127.0.0.1:8000/ui/index.html?review=ui/demo/full</code></p>
+  </section>
+
+  <div id="app" hidden>
+
+    <section class="card run-info" aria-labelledby="run-info-heading">
+      <h2 id="run-info-heading">Run information</h2>
+      <dl class="meta-grid">
+        <div><dt>Training epochs</dt><dd id="run-epochs">&mdash;</dd></div>
+        <div><dt>Training time grid</dt><dd id="run-train-grid">&mdash;</dd></div>
+        <div><dt>Inference time grid</dt><dd id="run-infer-grid">&mdash;</dd></div>
+        <div><dt>Frames per prediction</dt><dd id="run-frames">&mdash;</dd></div>
+      </dl>
+      <p class="note warn" id="run-override-note" hidden></p>
+      <p class="note" id="run-limitations-note"></p>
+    </section>
+
+    <section class="card" aria-labelledby="meta-heading">
+      <h2 id="meta-heading">Match</h2>
+      <dl class="meta-grid">
+        <div><dt>Match ID</dt><dd id="meta-match">&mdash;</dd></div>
+        <div><dt>Player POV</dt><dd id="meta-pov">&mdash;</dd></div>
+        <div><dt>Actual result</dt><dd id="meta-result">&mdash;</dd></div>
+        <div><dt>Observation setting</dt><dd id="meta-observation">&mdash;</dd></div>
+        <div><dt>Sample ID</dt><dd id="meta-sample">&mdash;</dd></div>
+        <div><dt>Checkpoint</dt><dd id="meta-epoch">&mdash;</dd></div>
+      </dl>
+      <p class="note" id="meta-prediction"></p>
+      <p class="note mono" id="meta-source"></p>
+    </section>
+
+    <section class="card" aria-labelledby="chart-heading">
+      <h2 id="chart-heading">Terran win probability over elapsed time</h2>
+      <p class="empty" id="chart-empty" hidden>No prediction points are available in this export.</p>
+      <div id="chart-wrap" class="chart-wrap" hidden>
+        <svg id="chart" viewBox="0 0 760 340" role="img" aria-labelledby="chart-title chart-desc">
+          <title id="chart-title">Terran win probability by prediction cutoff</title>
+          <desc id="chart-desc">Line chart of Terran win probability against elapsed game time. Shaded bands mark pivotal intervals; ringed dots mark cutoffs that have a Grad-CAM heatmap.</desc>
+        </svg>
+        <ul class="legend">
+          <li><span class="legend-dot" aria-hidden="true"></span> prediction point (click to inspect)</li>
+          <li><span class="legend-ring" aria-hidden="true"></span> Grad-CAM heatmap available</li>
+          <li><span class="legend-band" aria-hidden="true"></span> pivotal interval</li>
+          <li><span class="legend-rule" aria-hidden="true"></span> 50% reference line</li>
+        </ul>
+      </div>
+      <p class="readout" id="readout" aria-live="polite"></p>
+      <p class="note" id="threshold-note"></p>
+    </section>
+
+    <section class="card" aria-labelledby="intervals-heading">
+      <h2 id="intervals-heading">Pivotal intervals</h2>
+      <p class="note" id="intervals-note"></p>
+      <ul id="interval-list" class="interval-list"></ul>
+      <p class="empty" id="intervals-empty" hidden></p>
+      <p class="hint" id="intervals-hint" hidden></p>
+    </section>
+
+    <section class="card" aria-labelledby="detail-heading">
+      <h2 id="detail-heading">Selected prediction point</h2>
+      <p class="empty" id="detail-empty">Select a pivotal interval or a prediction point to inspect it.</p>
+      <div id="detail" hidden>
+        <dl class="meta-grid">
+          <div><dt>Prediction cutoff</dt><dd id="detail-cutoff">&mdash;</dd></div>
+          <div><dt>Win probability</dt><dd id="detail-probability">&mdash;</dd></div>
+          <div><dt>Model prediction</dt><dd id="detail-prediction">&mdash;</dd></div>
+          <div><dt>Observed frames</dt><dd id="detail-window">&mdash;</dd></div>
+        </dl>
+
+        <h3>Grad-CAM evidence</h3>
+        <p class="note" id="heatmap-status"></p>
+        <dl class="meta-grid">
+          <div><dt>Prediction cutoff</dt><dd id="hm-cutoff">&mdash;</dd></div>
+          <div><dt>Image observation time</dt><dd id="hm-observed">&mdash;</dd></div>
+          <div><dt>Evidence supports</dt><dd id="hm-target">&mdash;</dd></div>
+          <div><dt>Heatmap file</dt><dd id="hm-file" class="mono">&mdash;</dd></div>
+        </dl>
+        <figure id="heatmap-figure" class="heatmap" hidden>
+          <img id="heatmap-image" alt="" decoding="async">
+          <figcaption id="heatmap-caption"></figcaption>
+        </figure>
+        <p class="empty" id="heatmap-missing" hidden></p>
+        <p class="error" id="heatmap-error" hidden></p>
+
+        <h3>Masking diagnostic</h3>
+        <div id="masking-body"></div>
+      </div>
+    </section>
+
+    <section class="card" aria-labelledby="actions-heading">
+      <h2 id="actions-heading">Action records</h2>
+      <p class="empty" id="actions-empty">No action records available. This export contains observation frames and heatmaps only; recorded actions are not part of the current data format.</p>
+    </section>
+
+    <section class="card" aria-labelledby="limits-heading">
+      <h2 id="limits-heading">Limitations</h2>
+      <ul class="limits">
+        <li>Heatmaps show model evidence, not causal effects.</li>
+        <li>The probabilities in this export are not calibrated.</li>
+      </ul>
+      <p class="note" id="limitations-text"></p>
+    </section>
+
+  </div>
+</main>
+
+<noscript><p class="banner banner-error">This page needs JavaScript enabled to read <code>review.json</code>.</p></noscript>
+
+<script src="app.js"></script>
+</body>
+</html>

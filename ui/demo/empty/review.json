@@ -1,0 +1,17 @@
+{
+  "demo": true,
+  "demo_note": "Synthetic values for interface testing. Not model output. Not a real match.",
+  "sample_id": "demo-empty-not-a-real-replay_both_player_1",
+  "replay_id": "demo-empty-not-a-real-replay",
+  "focus_player_id": 1,
+  "label": 1,
+  "checkpoint": "runs/demo-placeholder/best.pt",
+  "checkpoint_epoch": 1,
+  "observation_setting": "separate fog-limited POVs",
+  "threshold": 0.1,
+  "merge_seconds": 60.0,
+  "points": [],
+  "pivotal_intervals": [],
+  "explanations": [],
+  "limitations": "DEMO DATA: synthetic values created for interface testing only. They are not model predictions and do not describe a real match. A real export also records that the validation match was used for model selection, that the probabilities are uncalibrated, and that heatmaps show model evidence rather than causal effects."
+}
