@@ -64,7 +64,8 @@
     imageToken: 0,
     bindingsReady: false,
     uploading: false,
-    modalBound: false
+    modalBound: false,
+    previewTab: 'minimap'  // 'minimap' | 'game' | 'gradcam'
   };
 
   var modalState = { open: false, scale: 1, x: 0, y: 0, drag: null, trigger: null };
@@ -494,6 +495,21 @@
     });
     $('peak-toggle').addEventListener('click', togglePeakOverlay);
     $('game-view-generate').addEventListener('click', generateGameView);
+    $('preview-tabs').addEventListener('click', function (event) {
+      var tab = event.target && event.target.getAttribute
+        ? event.target.closest('[data-tab]') : null;
+      if (tab) { setPreviewTab(tab.getAttribute('data-tab')); }
+    });
+    $('preview-tabs').addEventListener('keydown', function (event) {
+      var order = ['minimap', 'game', 'gradcam'];
+      var position = order.indexOf(state.previewTab);
+      if (event.key !== 'ArrowRight' && event.key !== 'ArrowLeft') { return; }
+      event.preventDefault();
+      position += event.key === 'ArrowRight' ? 1 : -1;
+      setPreviewTab(order[(position + order.length) % order.length], true);
+    });
+    $('moment-prev').addEventListener('click', function () { stepMoment(-1); });
+    $('moment-next').addEventListener('click', function () { stepMoment(1); });
     bindImageModal();
   }
 
@@ -1004,6 +1020,8 @@
     var token = ++state.jobToken;
     showView('report');
     show($('pov-bar'), true);
+    show($('pov-buttons'), true);
+    show($('pov-note'), true);
     show($('report-error'), false);
     show($('app'), false);
     svgClear($('pov-buttons'));
@@ -1055,8 +1073,7 @@
       button.setAttribute('data-player', pov.player);
       button.appendChild(createEl('span', 'pov-title', playerTitle(pov)));
       var result = pov.result ? String(pov.result) : 'result not recorded';
-      var label = pov.label === 1 ? 'focus-player label 1' : (pov.label === 0 ? 'focus-player label 0' : 'label not recorded');
-      button.appendChild(createEl('span', 'pov-result', result + ' \u00b7 ' + label));
+      button.appendChild(createEl('span', 'pov-result', result));
       if (pov.player === selectedPlayer) { button.classList.add('is-selected'); }
       button.setAttribute('aria-pressed', pov.player === selectedPlayer ? 'true' : 'false');
       button.addEventListener('click', function () {
@@ -1065,10 +1082,8 @@
       });
       container.appendChild(button);
     });
-    var replay = index.replay || {};
-    var map = replay.map_title ? ' \u00b7 ' + replay.map_title : '';
-    setText($('pov-note'), 'Job ' + (index.job_id || '') + map +
-      ' \u00b7 ' + povs.length + ' POVs. The selected POV decides which player is treated as self.');
+    setText($('pov-note'), povs.length + ' player POVs. ' +
+      'The selected POV decides which player is treated as self.');
   }
 
   function findPov(index, player) {
@@ -1138,15 +1153,8 @@
     var info = probabilityInfo(data);
     var parts = [];
     parts.push('Showing ' + playerTitle(pov) + (pov.result ? ' (' + pov.result + ')' : '') + '.');
-    if (info.focus) {
-      parts.push('Estimated probability that ' + subjectDisplay(info) +
-        ' wins, based on observations from this POV. Class 1 means this player wins, class 0 means this player loses. ' +
-        'The two POVs use different observations and need not sum to 100%.');
-    } else {
-      parts.push('Estimated probability that ' + info.subject + ' wins, based on observations from this POV; ' +
-        'class 1 means ' + info.subject + ' wins.');
-    }
-    parts.push('Switching the POV reloads the curve, the selected point and its heatmap.');
+    parts.push('The probability is P(' + subjectDisplay(info) +
+      ' wins) from this POV only. Switching the POV reloads the timeline and the preview.');
     setText($('pov-note'), parts.join(' '));
   }
 
@@ -1193,7 +1201,9 @@
     state.reviewDir = parsed.reviewDir;
     state.jsonUrl = parsed.jsonUrl;
     showView('report');
-    show($('pov-bar'), false);
+    show($('pov-bar'), true);
+    show($('pov-buttons'), false);
+    show($('pov-note'), false);
     show($('report-error'), false);
     var token = ++state.reviewToken;
 
@@ -1226,7 +1236,9 @@
     state.info = probabilityInfo(data);
     state.isDemo = data.demo === true || /(^|\/)demo(\/|$)/i.test(state.jsonUrl.pathname);
     state.showAllIntervals = false;
+    state.previewTab = 'minimap';
     cancelHeatmapTask();
+    cancelGameViewTask();
     showView('report');
     show($('help-panel'), false);
     show($('banner'), false);
@@ -1331,6 +1343,9 @@
       ? stateText(engine.game_version) + ' / build ' + stateText(engine.base_build) +
         (engine.data_version ? ' / data ' + engine.data_version : '')
       : 'not recorded');
+    setText($('tech-label'), [stateText(data.label_definition), stateText(data.label_meaning)]
+      .filter(function (value) { return value && value !== 'not recorded'; })
+      .join(' \u00b7 ') || 'not recorded');
     setText($('tech-checkpoint-sha'), stateText(data.checkpoint_sha256));
 
     var overrideNote = $('run-override-note');
@@ -1353,43 +1368,65 @@
       ? 'n/a' : 'Player ' + String(data.focus_player_id) +
         (data.focus_player_race ? ' (' + String(data.focus_player_race) + ')' : ''));
     setText($('meta-result'), resultText(data));
+    setText($('ws-result'), resultText(data));
     setText($('meta-sample'), data.sample_id ? String(data.sample_id) : 'not recorded');
     setText($('meta-epoch'), data.checkpoint_epoch === undefined || data.checkpoint_epoch === null
       ? 'not recorded' : 'epoch ' + String(data.checkpoint_epoch));
+
+    var index = state.job && state.job.index ? state.job.index : null;
+    var replay = index && index.replay && typeof index.replay === 'object' ? index.replay : null;
+    var mapTitle = replay && replay.map_title ? String(replay.map_title).trim() : '';
+    setText($('meta-map'), mapTitle || 'not recorded in this export');
+
+    var title = reportTitleParts(data);
+    setText($('ws-title'), title.title);
+    setText($('ws-subtitle'), title.subtitle);
+    var titleNode = $('ws-title');
+    if (titleNode) { titleNode.title = replayId; }
 
     var points = pointsOf(data);
     var info = state.info || probabilityInfo(data);
     var last = points.length ? points[points.length - 1] : null;
     var lastProbability = pointProbability(last);
     if (Number.isFinite(lastProbability)) {
-      var agrees = ((lastProbability >= 0.5 ? 1 : 0) === data.label);
       setText($('meta-prediction'),
-        'At the final cutoff (' + fmtClock(num(last.cutoff_seconds)) + ') the estimated probability that ' +
-        subjectDisplay(info) + ' wins is ' + fmtPercent(lastProbability) + ' (' +
-        favouredDisplay(lastProbability) + ' favoured); this ' +
-        (agrees ? 'agrees with' : 'differs from') + ' the actual result. ' +
-        'The two POVs use different observations and need not sum to 100%.');
+        'At the final cutoff (' + fmtClock(num(last.cutoff_seconds)) + ') the model estimated ' +
+        fmtPercent(lastProbability) + ' for ' + subjectDisplay(info) + '. Actual result: ' +
+        resultText(data) + '. This value belongs to this POV only; the other POV is a separate prediction.');
     } else {
       setText($('meta-prediction'), 'No prediction point is available in this export.');
     }
     setText($('meta-source'), data.checkpoint ? String(data.checkpoint) : 'not recorded');
   }
 
-  function renderStaticNotes(data) {
-    var threshold = num(data.threshold);
-    var rule = data && data.interval_rule && typeof data.interval_rule === 'object'
-      ? data.interval_rule : null;
-    if (rule) {
-      setText($('threshold-note'), intervalRuleText(data) +
-        ' Orange bands and the interval list use the same candidate data.');
-    } else if (Number.isFinite(threshold)) {
-      setText($('threshold-note'),
-        'This legacy export records intervals at an absolute change of at least ' +
-        fmtPoints(threshold) + '. Its original merge rule is not fully described; ' +
-        'the orange bands and list still use the same stored interval data.');
-    } else {
-      setText($('threshold-note'), 'This export does not record an interval threshold.');
+  /* A readable match title only uses fields that exist in the loaded export:
+   * the map title from the report index, otherwise the replay id. */
+  function reportTitleParts(data) {
+    var index = state.job && state.job.index ? state.job.index : null;
+    var replay = index && index.replay && typeof index.replay === 'object' ? index.replay : null;
+    var mapTitle = replay && replay.map_title ? String(replay.map_title).trim() : '';
+    var races = [];
+    if (index && Array.isArray(index.povs)) {
+      index.povs.forEach(function (pov) {
+        if (pov.focus_player_race) { races.push(String(pov.focus_player_race)); }
+      });
     }
+    if (mapTitle) {
+      return {
+        title: mapTitle,
+        subtitle: races.length ? races.join(' vs ') + ' \u00b7 replay report' : 'Replay report'
+      };
+    }
+    var id = data.replay_id ? String(data.replay_id) : '';
+    if (id) {
+      return { title: 'Match ' + id.slice(0, 12) + '\u2026', subtitle: 'Full match ID in Match details' };
+    }
+    return { title: 'Replay report', subtitle: '' };
+  }
+
+  /* The interval rule itself lives in Technical details; the main view keeps a
+   * single sentence in the moments panel. */
+  function renderStaticNotes(data) {
     setText($('limitations-text'), data.limitations ? String(data.limitations) : '');
   }
 
@@ -1468,13 +1505,11 @@
     var info = state.info || probabilityInfo(data);
     if (info.focus) {
       setText($('chart-subject'),
-        'Estimated probability that ' + subjectDisplay(info) + ' wins, based on observations from this POV. ' +
-        'Class 1 means this player wins; class 0 means this player loses. ' +
-        'The two POVs use different observations and need not sum to 100%.');
+        'Estimated probability that ' + subjectDisplay(info) +
+        ' wins, from this POV. Click a point to inspect that cutoff.');
     } else {
       setText($('chart-subject'),
-        'Estimated probability that Terran wins, based on observations from this POV. ' +
-        'Class 1 means Terran wins; class 0 means Protoss wins.');
+        'Estimated probability that Terran wins, from this POV. Click a point to inspect that cutoff.');
     }
 
     var geometry = chartGeometry(points, layout);
@@ -1648,37 +1683,27 @@
     svgClear(list);
     var allIntervals = intervalsOf(data);
     var entries = intervalEntries(data, state.showAllIntervals);
-    var threshold = num(data.threshold);
     var toggle = $('intervals-toggle');
 
     if (!allIntervals.length) {
-      setText($('intervals-note'), 'No candidate pivotal interval was detected in this export.');
       show($('intervals-empty'), true);
       setText($('intervals-empty'), points.length
-        ? 'No adjacent probability change reached ' + fmtPoints(threshold) +
-          ', so no candidate interval is marked. The last prediction point is selected below and can still be inspected.'
-        : 'No candidate interval was detected and no prediction points are available.');
+        ? 'No adjacent probability change reached ' + fmtPoints(num(data.threshold)) +
+          ', so no suggested moment is marked. The timeline still has prediction points to inspect.'
+        : 'No suggested moment was detected and no prediction points are available.');
       show($('intervals-hint'), points.length > 0);
-      setText($('intervals-hint'), 'Tip: click any point on the chart, or focus it with the keyboard, to inspect that cutoff.');
+      setText($('intervals-hint'), 'Tip: click any point on the timeline, or focus it with the keyboard, to inspect that cutoff.');
       show(toggle, false);
+      syncMomentNav();
       return;
     }
 
-    var note = allIntervals.length + ' candidate pivotal interval' +
-      (allIntervals.length === 1 ? '' : 's') + ' detected. These mark model-predicted changes, not proven match-deciding events.';
-    if (entries.length < allIntervals.length) {
-      note += ' Showing the 3 largest by absolute net change, in time order.';
-    } else {
-      note += ' Showing all candidates in time order.';
-    }
-    setText($('intervals-note'), note);
     show($('intervals-empty'), false);
     show($('intervals-hint'), false);
-
     show(toggle, allIntervals.length > 3);
     toggle.textContent = state.showAllIntervals
       ? 'Show the 3 largest only'
-      : 'Show all ' + allIntervals.length + ' candidate intervals';
+      : 'Show all ' + allIntervals.length + ' suggested moments';
 
     entries.forEach(function (entry) {
       var interval = entry.interval;
@@ -1690,31 +1715,27 @@
         ? num(interval.max_step_change) : num(interval.peak_change);
       var maxCutoff = Number.isFinite(num(interval.max_step_cutoff_seconds))
         ? num(interval.max_step_cutoff_seconds) : num(interval.peak_cutoff_seconds);
+      var rangeText = fmtClock(num(interval.start_seconds)) + ' \u2013 ' + fmtClock(num(interval.end_seconds));
+      var startText = fmtPercent(num(interval.start_probability));
+      var endText = fmtPercent(num(interval.end_probability));
+      var netText = signedPoints(num(interval.net_change));
 
       var button = document.createElement('button');
       button.type = 'button';
       button.className = 'interval-button';
       button.setAttribute('data-index', String(index));
+      button.setAttribute('aria-label', 'Suggested moment ' + rangeText + ', ' + startText +
+        ' to ' + endText + ' (' + netText + ') for ' + subjectDisplay());
 
       var range = document.createElement('span');
       range.className = 'interval-range';
-      range.textContent = fmtClock(num(interval.start_seconds)) + ' \u2013 ' + fmtClock(num(interval.end_seconds));
+      range.textContent = rangeText;
       button.appendChild(range);
 
       var change = document.createElement('span');
       change.className = 'interval-change';
-      change.textContent = subjectDisplay() + ' ' +
-        fmtPercent(num(interval.start_probability)) + ' \u2192 ' +
-        fmtPercent(num(interval.end_probability)) + ' (' + signedPoints(num(interval.net_change)) + ')';
+      change.textContent = startText + ' \u2192 ' + endText + ' \u00b7 ' + netText;
       button.appendChild(change);
-
-      var meta = document.createElement('span');
-      meta.className = 'interval-meta';
-      meta.textContent = 'Max single step ' + signedPoints(maxStep) + ' at ' + fmtClock(maxCutoff) +
-        ' \u00b7 Net ' + signedPoints(num(interval.net_change)) +
-        (Number.isFinite(changes) ? ' \u00b7 ' + changes +
-          (changes === 1 ? ' adjacent change' : ' adjacent changes') : '');
-      button.appendChild(meta);
 
       var badge = document.createElement('span');
       badge.className = 'badge ' + (explanation ? 'badge-heatmap' : 'badge-no');
@@ -1723,10 +1744,77 @@
 
       button.addEventListener('click', function () { selectInterval(index); });
 
-      var item = document.createElement('li');
+      var more = document.createElement('details');
+      more.className = 'moment-more';
+      more.appendChild(createEl('summary', null, 'Details'));
+      more.appendChild(createEl('p', null,
+        'Max single step ' + signedPoints(maxStep) + ' at ' + fmtClock(maxCutoff) +
+        (Number.isFinite(changes) ? ' \u00b7 ' + changes +
+          (changes === 1 ? ' adjacent change' : ' adjacent changes') : '')));
+
+      var item = createEl('li', 'moment-item');
       item.appendChild(button);
+      item.appendChild(more);
       list.appendChild(item);
     });
+    syncMomentNav();
+  }
+
+  /* Previous/Next follow the moment's actual selected cutoff, not list order. */
+  function momentSequence(data) {
+    return intervalsOf(data).map(function (interval, index) {
+      return { index: index, time: num(interval.peak_cutoff_seconds) };
+    }).sort(function (left, right) { return left.time - right.time; });
+  }
+
+  function currentMomentPosition(sequence) {
+    for (var position = 0; position < sequence.length; position += 1) {
+      if (sequence[position].index === state.selectedInterval) { return position; }
+    }
+    return -1;
+  }
+
+  function syncMomentNav() {
+    var previous = $('moment-prev');
+    var next = $('moment-next');
+    if (!previous || !next) { return; }
+    var sequence = state.data ? momentSequence(state.data) : [];
+    var position = currentMomentPosition(sequence);
+    var hasAny = sequence.length > 0;
+    previous.disabled = !hasAny || position <= 0;
+    next.disabled = !hasAny || position >= sequence.length - 1;
+  }
+
+  function ensureMomentVisible(index) {
+    var data = state.data;
+    if (!data || state.showAllIntervals) { return; }
+    var visible = intervalEntries(data, false).some(function (entry) { return entry.index === index; });
+    if (visible) { return; }
+    state.showAllIntervals = true;
+    var points = pointsOf(data);
+    renderChart(points, data);
+    renderIntervals(points, data);
+    updateChartSelection();
+  }
+
+  function stepMoment(delta) {
+    var data = state.data;
+    if (!data) { return; }
+    var sequence = momentSequence(data);
+    if (!sequence.length) { return; }
+    var position = currentMomentPosition(sequence);
+    var target = position === -1
+      ? (delta > 0 ? 0 : sequence.length - 1)
+      : position + delta;
+    if (target < 0 || target >= sequence.length) { return; }
+    var index = sequence[target].index;
+    ensureMomentVisible(index);
+    selectInterval(index);
+    var node = document.querySelector('.interval-button[data-index="' + index + '"]');
+    if (node) {
+      node.focus({ preventScroll: true });
+      if (typeof node.scrollIntoView === 'function') { node.scrollIntoView({ block: 'nearest' }); }
+    }
   }
 
   function toggleIntervals() {
@@ -1756,6 +1844,7 @@
     state.selectedInterval = index;
     state.selected = findPointIndex(pointsOf(data), num(interval.peak_cutoff_seconds));
     syncIntervalButtons();
+    syncMomentNav();
     updateChartSelection();
     renderDetail();
   }
@@ -1772,6 +1861,7 @@
       if (Math.abs(num(interval.peak_cutoff_seconds) - cutoff) < EPSILON) { state.selectedInterval = intervalIndex; }
     });
     syncIntervalButtons();
+    syncMomentNav();
     updateChartSelection();
     renderDetail();
   }
@@ -1818,6 +1908,13 @@
     return NaN;
   }
 
+  function clearSelectionStrip() {
+    setText($('sel-time'), '\u2014');
+    setText($('sel-subject'), '\u2014');
+    setText($('sel-prob'), '\u2014');
+    setText($('sel-image'), '');
+  }
+
   function renderDetail() {
     var data = state.data;
     var points = pointsOf(data);
@@ -1831,7 +1928,12 @@
       show($('detail'), false);
       setText($('readout'), '');
       renderHeatmap(NaN, imageToken);
+      renderContext(NaN, null, imageToken);
+      renderGameView(null, imageToken);
+      renderHeatmapOnDemand(NaN);
       renderMasking();
+      syncMomentNav();
+      syncPreview();
       return;
     }
     show($('detail-empty'), false);
@@ -1844,37 +1946,84 @@
     var probability = point
       ? pointProbability(point)
       : num(interval ? interval.end_probability : NaN);
+    var subject = subjectDisplay(info);
+    var explanation = findExplanation(data, cutoff);
 
-    setText($('detail-cutoff'), fmtSeconds(cutoff) + ' (' + fmtClock(cutoff) + ')');
-    if (Number.isFinite(probability)) {
-      setText($('detail-probability'),
-        subjectDisplay(info) + ' ' + fmtPercent(probability) + ' / ' +
-        opponentDisplay(info) + ' ' + fmtPercent(1 - probability));
-      setText($('detail-prediction'), favouredDisplay(probability) + ' favoured at this cutoff');
-      setText($('readout'), 'Cutoff ' + fmtClock(cutoff) + ' \u2014 ' + subjectDisplay(info) + ' ' +
-        fmtPercent(probability) + ', ' + opponentDisplay(info) + ' ' + fmtPercent(1 - probability));
-    } else {
-      setText($('detail-probability'), 'not provided');
-      setText($('detail-prediction'), 'not provided');
-      setText($('readout'), 'Cutoff ' + fmtClock(cutoff) + ' \u2014 probability not provided');
-    }
-
-    var seconds = point && Array.isArray(point.frame_seconds)
-      ? point.frame_seconds.filter(function (value) { return Number.isFinite(value); })
-      : [];
-    if (seconds.length) {
-      var first = Math.min.apply(null, seconds);
-      var last = Math.max.apply(null, seconds);
-      setText($('detail-window'), seconds.length + ' frames between ' + fmtSeconds(first) +
-        ' and ' + fmtSeconds(last));
-    } else {
-      setText($('detail-window'), 'not recorded; this export does not list the sampled frame times');
-    }
+    /* Only the probability of the current focus object is shown. The complement
+     * is not the other POV's prediction and is deliberately not displayed. */
+    setText($('sel-time'), fmtClock(cutoff));
+    setText($('sel-subject'), subject);
+    setText($('sel-prob'), Number.isFinite(probability) ? fmtPercent(probability) : 'not provided');
+    setText($('readout'), 'Cutoff ' + fmtClock(cutoff) + ' \u2014 ' + subject + ' ' +
+      (Number.isFinite(probability) ? fmtPercent(probability) : 'not provided'));
 
     renderHeatmap(cutoff, imageToken);
-    renderContext(cutoff, findExplanation(state.data, cutoff), imageToken);
+    renderContext(cutoff, explanation, imageToken);
+    renderGameView(explanation, imageToken);
     renderHeatmapOnDemand(cutoff);
     renderMasking();
+    syncMomentNav();
+    syncPreview();
+  }
+
+  /* Tab switching only changes which already-rendered image is visible. */
+  function setPreviewTab(tab, focus) {
+    if (['minimap', 'game', 'gradcam'].indexOf(tab) < 0) { return; }
+    state.previewTab = tab;
+    syncPreview();
+    if (focus) {
+      var node = $('tab-' + tab);
+      if (node) { node.focus(); }
+    }
+  }
+
+  function syncPreview() {
+    ['minimap', 'game', 'gradcam'].forEach(function (name) {
+      var button = $('tab-' + name);
+      var pane = $('pane-' + name);
+      var active = name === state.previewTab;
+      if (button) {
+        button.classList.toggle('is-selected', active);
+        button.setAttribute('aria-selected', active ? 'true' : 'false');
+        button.tabIndex = active ? 0 : -1;
+      }
+      if (pane) { pane.hidden = !active; }
+    });
+    updateSelectionImage();
+  }
+
+  function updateSelectionImage() {
+    var data = state.data;
+    var cutoff = data ? currentCutoff() : NaN;
+    var explanation = data ? findExplanation(data, cutoff) : null;
+    var text = '';
+    if (!Number.isFinite(cutoff)) {
+      setText($('sel-image'), '');
+      return;
+    }
+    if (state.previewTab === 'minimap') {
+      var frame = explanation && explanation.context_frame && typeof explanation.context_frame === 'object'
+        ? explanation.context_frame : null;
+      var seconds = frame ? num(frame.frame_seconds) : NaN;
+      text = 'Minimap \u00b7 ' + (Number.isFinite(seconds)
+        ? 'context image time ' + fmtClock(seconds)
+        : 'no recorded context image time');
+    } else if (state.previewTab === 'game') {
+      var view = explanation && explanation.game_view && typeof explanation.game_view === 'object'
+        ? explanation.game_view : null;
+      var actual = view ? num(view.actual_seconds) : NaN;
+      text = 'Game view \u00b7 ' + (Number.isFinite(actual)
+        ? 'rendered at ' + fmtClock(actual)
+        : 'no rendered image for this moment');
+    } else {
+      var observed = explanation ? num(explanation.displayed_frame_seconds) : NaN;
+      var meaning = explanation && explanation.target_meaning
+        ? String(explanation.target_meaning) : '';
+      text = 'Grad-CAM \u00b7 cutoff ' + fmtClock(cutoff) +
+        (Number.isFinite(observed) ? ', image time ' + fmtClock(observed) : '') +
+        (meaning ? ' \u00b7 class: ' + meaning : '');
+    }
+    setText($('sel-image'), text);
   }
 
   function renderHeatmap(cutoff, imageToken) {
@@ -1899,6 +2048,8 @@
     setText($('hm-observed'), 'n/a');
     setText($('hm-target'), 'n/a');
     setText($('hm-file'), 'n/a');
+    setText($('hm-sampling'), 'n/a');
+    setText($('gradcam-note'), '');
 
     if (!explanation) {
       var explanations = explanationsOf(data);
@@ -1946,6 +2097,10 @@
         : 'The heatmap highlights evidence the model used for ' + side + '.') +
       (Number.isFinite(nativeBins) ? ' Native Grad-CAM temporal bins: ' + trimNum(nativeBins, 0) + '; bins overlap.' : '') +
       ' It does not show a cause of the outcome or a precise action.');
+    setText($('gradcam-note'),
+      'Bright regions mark the evidence this heatmap attributes to "' +
+      (targetMeaning || 'the target class') + '" (class ' + String(target) + '). ' +
+      'It summarizes the sampled history, not a frame-by-frame alignment with the minimap.');
 
     if (!explanation.image || typeof explanation.image !== 'string') {
       show(missing, true);
@@ -2016,11 +2171,10 @@
     setText($('attr-bin'), 'not recorded');
     setText($('attr-cell'), 'not recorded');
     setText($('attr-note'), '');
-    if (!explanation) { renderGameView(null, imageToken); return; }
+    if (!explanation) { return; }
 
     show(section, true);
     renderAttribution(explanation);
-    renderGameView(explanation, imageToken);
     var sampling = explanation.sampling && typeof explanation.sampling === 'object'
       ? explanation.sampling : null;
     var contextFrame = explanation.context_frame && typeof explanation.context_frame === 'object'
@@ -2045,6 +2199,13 @@
     var contextLoop = contextFrame ? num(contextFrame.game_loop) : NaN;
     var source = contextFrame && contextFrame.source
       ? contextFrame.source : (sampling ? sampling.source : 'unknown');
+    setText($('hm-sampling'), sampling
+      ? (Number.isFinite(num(sampling.frames)) ? trimNum(num(sampling.frames), 0) + ' frames' : 'frame count not recorded') +
+        (Number.isFinite(num(sampling.min_seconds)) && Number.isFinite(num(sampling.max_seconds))
+          ? ' between ' + fmtClock(num(sampling.min_seconds)) + ' and ' + fmtClock(num(sampling.max_seconds))
+          : '') +
+        ' \u00b7 ' + samplingSourceText(source)
+      : 'not recorded in this export');
     setText($('context-meta'),
       'POV: ' + povLabel + '. Prediction cutoff: ' + prediction + '. ' +
       'Sampled observation range: ' + range + '. ' +
@@ -2306,11 +2467,14 @@
     var status = $('game-view-status');
     var error = $('game-view-error');
     var caption = $('game-view-caption');
+    var empty = $('game-view-empty');
 
     show(block, false);
     show(figure, false);
     show(error, false);
     show(button, false);
+    show(empty, false);
+    setText(empty, '');
     setText(status, '');
     setText(error, '');
     setText(caption, '');
@@ -2319,7 +2483,11 @@
     image.removeAttribute('src');
     button.disabled = false;
     button.textContent = 'Render game view';
-    if (!explanation) { return; }
+    if (!explanation) {
+      show(empty, true);
+      setText(empty, 'No Grad-CAM explanation is available for this moment, so there is no context frame to render.');
+      return;
+    }
 
     show(block, true);
     var gameView = explanation.game_view && typeof explanation.game_view === 'object'

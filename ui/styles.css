@@ -719,17 +719,195 @@ code {
 }
 body.modal-open { overflow: hidden; }
 
-/* ---------- print ---------- */
+/* ---------- review workspace ---------- */
+#app {
+  display: grid;
+  gap: 18px;
+  grid-template-columns: minmax(0, 1.55fr) minmax(290px, 0.9fr);
+  grid-template-areas:
+    "preview moments"
+    "chart   chart"
+    "tech    tech";
+  align-items: start;
+}
+#app > .card { margin: 0; }
+#chart-section { grid-area: chart; }
+#moments-panel { grid-area: moments; }
+#preview-panel { grid-area: preview; }
+#app > section:last-of-type { grid-area: tech; }
+#app > .limitations-note { grid-column: 1 / -1; margin-top: 0; }
+
+.ws-toolbar { border-left: 4px solid var(--accent); }
+.ws-toolbar-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px 18px;
+}
+.ws-title-block { min-width: 0; flex: 1 1 240px; }
+.ws-title {
+  margin: 0;
+  font-size: 1.25rem;
+  letter-spacing: -0.01em;
+  overflow-wrap: anywhere;
+}
+.ws-subtitle { margin: 2px 0 0; }
+.ws-result {
+  margin: 0;
+  font-weight: 700;
+  color: var(--accent-dark);
+  font-size: 0.95rem;
+}
+.ws-result:empty { display: none; }
+.ws-home { white-space: nowrap; }
+#pov-buttons { margin-top: 12px; }
+#ws-meta { margin-top: 12px; }
+#pov-note { margin-top: 10px; }
+#pov-note:empty { display: none; }
+
+/* selection readout above the preview */
+.selection-strip {
+  display: grid;
+  gap: 2px;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--accent);
+  border-radius: 8px;
+  background: #f8fbfd;
+}
+.selection-line { margin: 0; font-size: 1.05rem; font-weight: 700; }
+.selection-sep { color: var(--muted); margin: 0 2px; }
+.selection-prob { margin: 0; font-size: 0.95rem; }
+.selection-label {
+  color: var(--muted);
+  font-size: 0.76rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-right: 6px;
+}
+#sel-prob { font-size: 1.3rem; color: var(--accent-dark); }
+.selection-image { margin: 2px 0 0; }
+
+/* preview tabs and single image stage */
+.preview-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 14px;
+  border-bottom: 1px solid var(--line);
+}
+.preview-tab {
+  font: inherit;
+  font-size: 0.9rem;
+  font-weight: 600;
+  padding: 8px 14px;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: 8px 8px 0 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.preview-tab:hover { background: #f2f6fb; color: var(--accent-dark); }
+.preview-tab.is-selected {
+  background: #fff;
+  border-color: var(--line);
+  color: var(--accent-dark);
+  box-shadow: inset 0 2px 0 var(--accent);
+}
+.preview-tab:focus-visible { outline: 2px solid var(--accent-dark); outline-offset: 2px; }
+.preview-stage { margin-top: 12px; min-height: 220px; }
+.preview-pane { min-width: 0; }
+.preview-pane h4 {
+  margin: 0 0 8px;
+  font-size: 0.95rem;
+  color: var(--accent-dark);
+}
+.preview-stage img {
+  display: block;
+  width: auto;
+  max-width: 100%;
+  max-height: min(46vh, 420px);
+  height: auto;
+  margin: 0 auto;
+  object-fit: contain;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+}
+.preview-stage .context-frame-wrap {
+  width: min(100%, 420px);
+  max-width: 420px;
+  margin: 0 auto;
+}
+.preview-stage .context-frame-wrap img {
+  width: 100%;
+  max-height: none;
+  border: none;
+  border-radius: 0;
+}
+.preview-stage .game-view-block { margin-top: 0; }
+.preview-stage .heatmap { margin: 0; }
+
+/* suggested moments */
+.moments-panel { min-width: 0; }
+.moments-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px 12px;
+}
+.moments-head h2 { margin: 0; }
+.moment-nav { display: flex; flex-wrap: wrap; gap: 6px; }
+.moment-nav .button-secondary { padding: 5px 10px; font-size: 0.8rem; }
+.moment-nav .button-secondary:disabled { color: #93a1b3; border-color: var(--line); cursor: not-allowed; background: #f7f9fc; }
+#moments-note { margin-top: 8px; }
+.interval-list { margin-top: 10px; }
+.moment-item { list-style: none; margin: 0; }
+.moment-more {
+  margin: 2px 0 0 4px;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+.moment-more summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--accent-dark);
+  font-size: 0.78rem;
+}
+.moment-more summary:focus-visible { outline: 2px solid var(--accent-dark); outline-offset: 2px; }
+.moment-more p { margin: 4px 0 0; }
+.interval-button.is-selected { outline: 2px solid var(--band); outline-offset: 1px; }
+
+/* minimap legend swatches (also used by print rules below) */
+.swatch-self { background: #2878ff; }
+.swatch-neutral { background: #969696; }
+.swatch-enemy { background: #ff3c3c; }
+.swatch-hidden { background: #000000; }
+.swatch-seen { background: #3f3f3f; }
+.swatch-visible { background: #c8c8c8; }
+
+
 @page { size: A4; margin: 12mm; }
 
 @media print {
   body { background: #fff; font-size: 11pt; }
   .skip-link, .page-header, #banner, #demo-banner, #public-banner,
-  #upload-view, #job-view, #help-panel, #pov-bar { display: none !important; }
+  #upload-view, #job-view, #help-panel { display: none !important; }
   main { max-width: none; padding: 0; }
+  #app { display: block; }
+  #app > .card { margin: 6mm 0; }
+  .pov-buttons, .ws-home, #pov-note, #ws-meta, #report-error,
+  .preview-tabs, .moment-nav, #intervals-toggle, .on-demand,
+  .context-section .actions, #game-view-block .actions { display: none !important; }
+  .ws-toolbar { margin: 0 0 4mm; padding: 8px 10px; border-left: 3px solid #55637a; }
+  .ws-title { font-size: 14pt; }
+  .ws-result { font-size: 10pt; }
   .card {
-    break-inside: avoid;
-    page-break-inside: avoid;
+    break-inside: auto;
+    page-break-inside: auto;
     margin: 8px 0;
     padding: 12px 14px;
     box-shadow: none;
@@ -753,17 +931,70 @@ body.modal-open { overflow: hidden; }
     margin: 0 auto;
   }
   .interval-list { break-inside: auto; }
-  .tech-details { break-inside: avoid; page-break-inside: avoid; }
-  .context-section, .context-map, .attribution-summary { break-inside: avoid; page-break-inside: avoid; }
+  .tech-details { break-inside: auto; page-break-inside: auto; }
+  .context-section, .context-map { break-inside: avoid; page-break-inside: avoid; }
   .game-view-block, .game-view { break-inside: avoid; page-break-inside: avoid; }
   #image-modal { display: none !important; }
   #context-image { max-width: 120mm; max-height: 120mm; margin: 0 auto; }
+
+  /* every already-exported preview image prints in order; nothing is generated */
+  .preview-pane[hidden] { display: block !important; }
+  .preview-pane + .preview-pane { margin-top: 4mm; }
+  .preview-pane::before {
+    display: block;
+    margin-bottom: 2mm;
+    font-size: 8.5pt;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: #33465b;
+  }
+  #pane-minimap::before { content: "Minimap (model input)"; }
+  #pane-game::before { content: "Game view"; }
+  #pane-gradcam::before { content: "Grad-CAM"; }
+  .preview-stage { break-inside: avoid; page-break-inside: avoid; }
+  .preview-stage img { max-height: 150mm; border: 1px solid #55637a; }
+  .context-frame-wrap { width: 110mm; }
+  .heatmap img { max-height: 150mm; }
+
+  /* swatch colours must stay visible in PDF without relying only on the
+     browser's optional background printing */
+  .legend-swatch {
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+    border: 1px solid #1d2836 !important;
+  }
+  .legend-swatch.swatch-visible { border-color: #55637a !important; }
+  .badge {
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+    border: 1px solid #55637a !important;
+    color: #1d2836 !important;
+    background: #fff !important;
+  }
+  .interval-button { break-inside: avoid; page-break-inside: avoid; }
+  #chart .band, #chart .point-dot, #chart .curve {
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
 }
 
 /* hover affordance for the existing heatmap image */
 #heatmap-image, #game-view-image { cursor: zoom-in; }
 
 /* ---------- responsive ---------- */
+@media (max-width: 900px) {
+  #app {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas:
+      "chart"
+      "moments"
+      "preview"
+      "tech";
+  }
+  .ws-toolbar-row { align-items: flex-start; }
+}
+
 @media (max-width: 560px) {
   .page-header { padding: 22px 14px 6px; }
   main { padding: 6px 14px 48px; }
@@ -772,4 +1003,15 @@ body.modal-open { overflow: hidden; }
   .meta-grid { grid-template-columns: 1fr; }
   .readout { font-size: 0.98rem; }
   .legend { font-size: 0.78rem; gap: 6px 12px; }
+  .ws-title { font-size: 1.1rem; }
+  .ws-toolbar-row { gap: 4px 10px; }
+  .ws-result { font-size: 0.88rem; }
+  .preview-tabs { gap: 4px; }
+  .preview-tab { padding: 7px 10px; font-size: 0.84rem; }
+  .selection-line { font-size: 0.98rem; }
+  #sel-prob { font-size: 1.15rem; }
+  .preview-stage { min-height: 0; }
+  .preview-stage img { max-height: 60vh; }
+  .moment-nav .button-secondary { padding: 5px 8px; }
+  .interval-change { font-size: 0.86rem; }
 }

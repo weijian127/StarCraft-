@@ -36,14 +36,33 @@ Leaving or switching the job aborts the pending request and clears the retry tim
 `completed`, `failed` and `interrupted` responses stop polling.
 
 The report fetches `GET /api/jobs/<job_id>/report` for the POV list and then loads each
-POV's sanitised `review.json`. It shows, in order, brief match/POV information, the
-curve, candidate intervals, the selected point with Grad-CAM, and collapsible technical
-details. The report:
+POV's sanitised `review.json`. The report is a review workspace rather than a long page:
+
+- a compact toolbar with the match title (the report index's `map_title`, otherwise the
+  replay id), the POV buttons, the selected player's actual result and a link back to the
+  upload entry; the full match id lives in the collapsed **Match details** panel;
+- a **Timeline** card with the probability curve, candidate bands, heatmap rings and the
+  50% reference line;
+- a **Suggested moments** card whose **Previous/Next** buttons follow the actual selected
+  cutoff of each moment;
+- a **Preview** card with Minimap / Game view / Grad-CAM tabs that share one image stage,
+  so only one image is visible at a time;
+- technical details last, collapsed by default.
+
+The preview is driven by one selection. Changing the cutoff or the POV clears the previous
+image, updates the selection strip and reloads each tab's content for the new moment.
+Tabs only switch visibility; they never start a generation request. The Minimap tab is the
+default and shows an explicit empty state when the export has no context image.
+
+The main view shows only the probability of the current object (`probability_key` /
+`probability_subject`); the complement is not displayed because it is not the other POV's
+prediction. The actual match result stays in the toolbar and in **Match details**.
+
+The report:
 
 - labels the curve as the estimated probability that the current POV's player wins,
-  based on that POV's observations; the two POVs need not sum to 100%;
-- plots the curve first, then the selected prediction point and heatmap;
-- uses POV buttons that reload every label, the curve, selected point and heatmap;
+  based on that POV's observations;
+- uses POV buttons that reload every label, the curve, the selection and the preview;
 - uses `target_meaning` for the heatmap class and keeps `displayed_frame_seconds`
   separate from the prediction cutoff;
 - removes the previous image immediately for a point without an explanation;
@@ -57,6 +76,12 @@ rule, not a paper result. The default list shows the three largest by absolute n
 change in time order; **Show all** expands the rest. Chart bands and list rows share the
 same `intervalEntries()` data.
 
+Each moment card shows its time range, `start → end` probability, the signed change in
+percentage points and whether a heatmap exists. The maximum single step and the number of
+adjacent changes are inside the card's own **Details** disclosure. The card area carries a
+single sentence: “Large changes in model predictions; not confirmed causes of the result.”
+The threshold, merge cap and “local display rule” note live in **Technical details**.
+
 For a backend job, selecting a saved point without a heatmap shows **Generate heatmap**.
 The browser posts only `player` and `cutoff_seconds`; the backend reuses the job's saved
 POV arrays and original checkpoint. The UI shows queued/running/completed/failed/busy
@@ -65,17 +90,22 @@ unique image name, so a refresh keeps it; repeated requests use the cache. Stati
 exports and demos show a clear “only available from a local backend job” message and do
 not send an API request.
 
-When an explanation has saved sampling metadata, the report shows a
-**Model-input minimap visualization** above the five-bin heatmap: self/neutral/enemy ownership colors,
-visibility colors (hidden/seen/visible), the last actual
-sampled frame, `Prediction cutoff`, `Sampled observation range`, and `Context image time`
-with game loop. Neutral objects (including resources) keep their original ownership color;
-secondary non-neutral ownership cells are shown as self in the reference image. Raw unit
-categories and model inputs are unchanged. An **Attribution summary**
-details panel is closed by default and reads the raw
-`data.npz` maximum, showing its temporal bin/cell, ties, or “no positive evidence”; an
-optional **Highest Grad-CAM region** outline uses the coarse 4×4 grid. It is not masking
-or a decisive-position claim.
+When an explanation has saved sampling metadata, the **Minimap** tab shows the
+model-input reference: self/enemy/neutral ownership colors, visibility colors
+(hidden/seen/visible) and the last actually sampled frame. The legend labels are
+`self`, `Neutral objects`, `enemy`, `hidden`, `seen`, `visible`. Neutral objects (including
+resources) keep their original ownership color; secondary non-neutral ownership cells are
+shown as self in the reference image. Raw unit categories and model inputs are unchanged.
+The selection strip above the tabs names the context image time when the export records
+`context_frame.frame_seconds`.
+
+The **Grad-CAM** tab shows the heatmap with a short sentence that names the real
+`target_meaning`; the full caption, the sampled history (`sampling.frames`, seconds and
+source) and the separate image observation time stay inside the collapsed
+**Grad-CAM details and interpretation** panel. The **Attribution summary** panel is a
+separate collapsed panel in **Technical details**; it reads the raw `data.npz` maximum and
+shows its temporal bin/cell or “no positive evidence”. An optional **Highest Grad-CAM
+region** outline uses the coarse 4×4 grid. It is not masking or a decisive-position claim.
 
 If that context loop is known, a backend job can also request one **Re-rendered game
 view** RGB frame (640×480) from the original replay/engine. It is cached in `review.json`
@@ -198,7 +228,7 @@ interval shows a working image.
 | `threshold`, `merge_seconds`, `interval_rule` | candidate-interval rule and parameters |
 | `points[].cutoff_seconds` | x axis (displayed as m:ss) |
 | `points[].<probability_key>` | y axis, 0..1 (Terran for legacy, current POV's player otherwise) |
-| `points[].frame_seconds` | observed frame window of that prediction, when recorded |
+| `points[].frame_seconds` | legacy optional sampled-frame list; the preview uses `explanations[].sampling` / `context_frame` instead |
 | `pivotal_intervals[].start_seconds` / `end_seconds` | candidate band on the chart |
 | `pivotal_intervals[].net_change` / `peak_change` | change in **percentage points** |
 | `pivotal_intervals[].max_step_change` / `max_step_cutoff_seconds` | largest single adjacent change in the candidate |
@@ -255,8 +285,16 @@ Notes:
   the same 4×4 row/column order as the raw array and is only a coarse reference.
 - Minimap, Grad-CAM and RGB images open in a modal viewer. Wheel/buttons zoom, dragging
   pans, Reset restores the view, Esc closes and focus returns to the trigger.
-- Print CSS keeps cards, the curve, context minimap, RGB view and heatmap from splitting
-  across pages and hides navigation/upload/status/modal sections.
+- Print CSS hides the tabs, moment navigation and on-demand actions, then prints the
+  already-exported panes in order (Minimap, Game view, Grad-CAM) without starting any
+  generation. Figures and the chart stay whole, while text may flow across pages so a
+  small technical panel no longer forces its own page. Legend swatches use
+  `print-color-adjust: exact` plus a dark border, so Self, Enemy, Neutral and the
+  visibility swatches remain distinguishable even when the browser's optional
+  “background graphics” setting is off.
+- Desktop uses a two-column grid (preview beside suggested moments, timeline below).
+  At 900 px and narrower the cards stack in reading order: Timeline → Suggested moments →
+  Preview → Technical details, with no horizontal scrolling.
 
 ## Empty and missing data
 

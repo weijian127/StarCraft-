@@ -93,30 +93,34 @@
   </section>
 
   <div id="report-view" hidden>
-    <nav id="pov-bar" class="card pov-bar" aria-label="Player POV" hidden>
-      <div class="pov-head">
-        <h2>Player POV</h2>
-        <a id="pov-home" class="button-link" href="#">Analyze another replay</a>
+    <nav id="pov-bar" class="card ws-toolbar" aria-label="Report toolbar" hidden>
+      <div class="ws-toolbar-row">
+        <div class="ws-title-block">
+          <h2 id="ws-title" class="ws-title">&mdash;</h2>
+          <p class="note ws-subtitle" id="ws-subtitle"></p>
+        </div>
+        <p class="ws-result" id="ws-result"></p>
+        <a id="pov-home" class="button-link ws-home" href="#">Back to upload</a>
       </div>
       <div id="pov-buttons" class="pov-buttons" role="group" aria-label="Switch player point of view"></div>
       <p class="note" id="pov-note"></p>
+      <details class="tech-details" id="ws-meta">
+        <summary>Match details</summary>
+        <dl class="meta-grid">
+          <div><dt>Match ID</dt><dd id="meta-match" class="mono match-id">&mdash;</dd></div>
+          <div><dt>Player POV</dt><dd id="meta-pov">&mdash;</dd></div>
+          <div><dt>Actual result</dt><dd id="meta-result">&mdash;</dd></div>
+          <div><dt>Map</dt><dd id="meta-map">&mdash;</dd></div>
+        </dl>
+        <p class="note" id="meta-prediction"></p>
+      </details>
       <p class="error" id="report-error" role="alert" hidden></p>
     </nav>
 
     <div id="app" hidden>
 
-    <section class="card" aria-labelledby="meta-heading">
-      <h2 id="meta-heading">Match</h2>
-      <dl class="meta-grid">
-        <div><dt>Match</dt><dd id="meta-match" class="mono match-id">&mdash;</dd></div>
-        <div><dt>Player POV</dt><dd id="meta-pov">&mdash;</dd></div>
-        <div><dt>Actual result</dt><dd id="meta-result">&mdash;</dd></div>
-      </dl>
-      <p class="note" id="meta-prediction"></p>
-    </section>
-
-    <section class="card" aria-labelledby="chart-heading">
-      <h2 id="chart-heading">Win probability over elapsed time</h2>
+    <section class="card chart-section" id="chart-section" aria-labelledby="chart-heading">
+      <h2 id="chart-heading">Timeline</h2>
       <p class="note" id="chart-subject"></p>
       <p class="empty" id="chart-empty" hidden>No prediction points are available in this export.</p>
       <div id="chart-wrap" class="chart-wrap" hidden>
@@ -132,112 +136,92 @@
         </ul>
       </div>
       <p class="readout" id="readout" aria-live="polite"></p>
-      <p class="note" id="threshold-note"></p>
     </section>
 
-    <section class="card" aria-labelledby="intervals-heading">
-      <h2 id="intervals-heading">Candidate pivotal intervals</h2>
-      <p class="note" id="intervals-note"></p>
+    <aside class="card moments-panel" id="moments-panel" aria-labelledby="moments-heading">
+      <div class="moments-head">
+        <h2 id="moments-heading">Suggested moments</h2>
+        <div class="moment-nav" role="group" aria-label="Move between suggested moments">
+          <button type="button" id="moment-prev" class="button-secondary" disabled>Previous moment</button>
+          <button type="button" id="moment-next" class="button-secondary" disabled>Next moment</button>
+        </div>
+      </div>
+      <p class="note" id="moments-note">Large changes in model predictions; not confirmed causes of the result.</p>
       <ul id="interval-list" class="interval-list"></ul>
       <p class="empty" id="intervals-empty" hidden></p>
       <p class="hint" id="intervals-hint" hidden></p>
       <div class="actions">
         <button type="button" id="intervals-toggle" class="button-secondary" hidden></button>
       </div>
-    </section>
+    </aside>
 
-    <section class="card" aria-labelledby="detail-heading">
-      <h2 id="detail-heading">Selected point and Grad-CAM</h2>
-      <p class="empty" id="detail-empty">Select a candidate interval or a prediction point to inspect it.</p>
+    <section class="card preview-panel" id="preview-panel" aria-labelledby="preview-heading">
+      <h2 id="preview-heading">Preview</h2>
+      <p class="empty" id="detail-empty">Select a suggested moment or a prediction point to inspect it.</p>
       <div id="detail" hidden>
-        <dl class="meta-grid">
-          <div><dt>Prediction cutoff</dt><dd id="detail-cutoff">&mdash;</dd></div>
-          <div><dt>Estimated probability</dt><dd id="detail-probability">&mdash;</dd></div>
-          <div><dt>Model prediction</dt><dd id="detail-prediction">&mdash;</dd></div>
-          <div><dt>Observed frames</dt><dd id="detail-window">&mdash;</dd></div>
-        </dl>
-
-        <h3>Grad-CAM evidence</h3>
-
-        <section id="context-section" class="context-section" hidden>
-          <h4>Model-input minimap visualization</h4>
-          <figure id="context-figure" class="context-map">
-            <div class="context-frame-wrap">
-              <img id="context-image" alt="" tabindex="0" role="button">
-              <div id="context-overlay" class="context-overlay" hidden></div>
+        <div class="selection-strip" aria-live="polite">
+          <p class="selection-line"><span id="sel-time">&mdash;</span> <span class="selection-sep">&middot;</span> <span id="sel-subject">&mdash;</span></p>
+          <p class="selection-prob"><span class="selection-label">Estimated win probability</span> <strong id="sel-prob">&mdash;</strong></p>
+          <p class="note selection-image" id="sel-image"></p>
+        </div>
+        <div class="preview-tabs" id="preview-tabs" role="tablist" aria-label="Preview image type">
+          <button type="button" class="preview-tab is-selected" id="tab-minimap" role="tab" aria-selected="true" aria-controls="pane-minimap" data-tab="minimap">Minimap</button>
+          <button type="button" class="preview-tab" id="tab-game" role="tab" aria-selected="false" aria-controls="pane-game" data-tab="game">Game view</button>
+          <button type="button" class="preview-tab" id="tab-gradcam" role="tab" aria-selected="false" aria-controls="pane-gradcam" data-tab="gradcam">Grad-CAM</button>
+        </div>
+        <div class="preview-stage" id="preview-stage">
+          <div class="preview-pane" id="pane-minimap" role="tabpanel" aria-labelledby="tab-minimap">
+            <section id="context-section" class="context-section" hidden>
+              <figure id="context-figure" class="context-map">
+                <div class="context-frame-wrap">
+                  <img id="context-image" alt="" tabindex="0" role="button">
+                  <div id="context-overlay" class="context-overlay" hidden></div>
+                </div>
+              </figure>
+              <ul class="legend context-legend" aria-label="Minimap feature legend">
+                <li><span class="legend-swatch swatch-self"></span> self</li>
+                <li><span class="legend-swatch swatch-neutral"></span> Neutral objects</li>
+                <li><span class="legend-swatch swatch-enemy"></span> enemy</li>
+                <li><span class="legend-swatch swatch-hidden"></span> hidden</li>
+                <li><span class="legend-swatch swatch-seen"></span> seen</li>
+                <li><span class="legend-swatch swatch-visible"></span> visible</li>
+              </ul>
+              <div class="actions">
+                <button type="button" id="peak-toggle" class="button-secondary" hidden>Show highest Grad-CAM region</button>
+              </div>
+            </section>
+            <p class="empty" id="context-empty" hidden></p>
+          </div>
+          <div class="preview-pane" id="pane-game" role="tabpanel" aria-labelledby="tab-game" hidden>
+            <section id="game-view-block" class="game-view-block" hidden>
+              <p class="note" id="game-view-status" role="status"></p>
+              <p class="error" id="game-view-error" role="alert" hidden></p>
+              <div class="actions">
+                <button type="button" id="game-view-generate" class="button-secondary">Render game view</button>
+              </div>
+              <figure id="game-view-figure" class="heatmap game-view" hidden>
+                <img id="game-view-image" alt="" tabindex="0" role="button" decoding="async">
+              </figure>
+            </section>
+            <p class="empty" id="game-view-empty" hidden></p>
+          </div>
+          <div class="preview-pane" id="pane-gradcam" role="tabpanel" aria-labelledby="tab-gradcam" hidden>
+            <figure id="heatmap-figure" class="heatmap" hidden>
+              <img id="heatmap-image" alt="" tabindex="0" role="button" decoding="async">
+            </figure>
+            <p class="empty" id="heatmap-missing" hidden></p>
+            <p class="error" id="heatmap-error" hidden></p>
+            <p class="note" id="gradcam-note"></p>
+            <div id="heatmap-on-demand" class="on-demand" hidden>
+              <p class="note" id="heatmap-generate-status" role="status"></p>
+              <p class="error" id="heatmap-generate-error" role="alert" hidden></p>
+              <div class="actions">
+                <button type="button" id="heatmap-generate" class="button-primary">Generate heatmap</button>
+                <button type="button" id="heatmap-retry" class="button-secondary" hidden>Retry heatmap</button>
+              </div>
             </div>
-          </figure>
-          <p class="empty" id="context-empty" hidden></p>
-          <ul class="legend context-legend" aria-label="Minimap feature legend">
-            <li><span class="legend-swatch" style="background:#2878ff"></span> self</li>
-            <li><span class="legend-swatch" style="background:#969696"></span> Neutral objects</li>
-            <li><span class="legend-swatch" style="background:#ff3c3c"></span> enemy</li>
-            <li><span class="legend-swatch" style="background:#000000"></span> hidden</li>
-            <li><span class="legend-swatch" style="background:#3f3f3f"></span> seen</li>
-            <li><span class="legend-swatch" style="background:#c8c8c8"></span> visible</li>
-          </ul>
-          <div class="actions">
-            <button type="button" id="peak-toggle" class="button-secondary" hidden>Show highest Grad-CAM region</button>
-          </div>
-        </section>
-
-        <section id="game-view-block" class="game-view-block" hidden>
-          <h4>Re-rendered game view</h4>
-          <p class="note" id="game-view-status" role="status"></p>
-          <p class="error" id="game-view-error" role="alert" hidden></p>
-          <div class="actions">
-            <button type="button" id="game-view-generate" class="button-secondary">Render game view</button>
-          </div>
-          <figure id="game-view-figure" class="heatmap game-view" hidden>
-            <img id="game-view-image" alt="" tabindex="0" role="button" decoding="async">
-          </figure>
-        </section>
-
-        <details class="tech-details attribution-summary" id="attribution-summary" hidden>
-          <summary>Attribution summary</summary>
-          <div class="attribution-body">
-            <dl class="meta-grid">
-              <div><dt>Target meaning</dt><dd id="attr-target">&mdash;</dd></div>
-              <div><dt>Highest raw Grad-CAM</dt><dd id="attr-max">&mdash;</dd></div>
-              <div><dt>Temporal bin</dt><dd id="attr-bin">&mdash;</dd></div>
-              <div><dt>Spatial cell</dt><dd id="attr-cell">&mdash;</dd></div>
-            </dl>
-            <p class="note" id="attr-note"></p>
-          </div>
-        </details>
-
-        <div id="heatmap-on-demand" class="on-demand" hidden>
-          <p class="note" id="heatmap-generate-status" role="status"></p>
-          <p class="error" id="heatmap-generate-error" role="alert" hidden></p>
-          <div class="actions">
-            <button type="button" id="heatmap-generate" class="button-primary">Generate heatmap</button>
-            <button type="button" id="heatmap-retry" class="button-secondary" hidden>Retry heatmap</button>
           </div>
         </div>
-        <figure id="heatmap-figure" class="heatmap" hidden>
-          <img id="heatmap-image" alt="" tabindex="0" role="button" decoding="async">
-        </figure>
-        <p class="empty" id="heatmap-missing" hidden></p>
-        <p class="error" id="heatmap-error" hidden></p>
-
-        <details class="tech-details gradcam-details" id="gradcam-details">
-          <summary>Grad-CAM details and interpretation</summary>
-          <p class="note" id="heatmap-status"></p>
-          <dl class="meta-grid">
-            <div><dt>Prediction cutoff</dt><dd id="hm-cutoff">&mdash;</dd></div>
-            <div><dt>Image observation time (export field)</dt><dd id="hm-observed">&mdash;</dd></div>
-            <div><dt>Evidence supports</dt><dd id="hm-target">&mdash;</dd></div>
-            <div><dt>Heatmap file</dt><dd id="hm-file" class="mono">&mdash;</dd></div>
-          </dl>
-          <p class="note" id="context-meta"></p>
-          <p class="note" id="context-caption"></p>
-          <p class="note" id="heatmap-caption"></p>
-          <p class="note" id="game-view-caption"></p>
-          <details class="tech-details" id="masking-details">
-            <summary>Masking diagnostic (technical)</summary>
-            <div id="masking-body"></div>
-          </details>
-        </details>
       </div>
     </section>
 
@@ -263,12 +247,46 @@
           <div><dt>Interval rule</dt><dd id="tech-interval-rule">&mdash;</dd></div>
           <div><dt>Training-set membership</dt><dd id="tech-membership">&mdash;</dd></div>
           <div><dt>Engine</dt><dd id="tech-engine">&mdash;</dd></div>
+          <div><dt>Label definition</dt><dd id="tech-label">&mdash;</dd></div>
         </dl>
         <p class="note warn" id="run-override-note" hidden></p>
         <p class="note" id="run-limitations-note"></p>
         <p class="note" id="limitations-text"></p>
         <p class="note">Action records: not available in this export.</p>
         <p class="note">If this is a public demo, a report URL can be viewed by anyone who has it; it is a bearer link.</p>
+      </details>
+
+      <details class="tech-details gradcam-details" id="gradcam-details">
+        <summary>Grad-CAM details and interpretation</summary>
+        <p class="note" id="heatmap-status"></p>
+        <dl class="meta-grid">
+          <div><dt>Prediction cutoff</dt><dd id="hm-cutoff">&mdash;</dd></div>
+          <div><dt>Image observation time (export field)</dt><dd id="hm-observed">&mdash;</dd></div>
+          <div><dt>Sampled history used by Grad-CAM</dt><dd id="hm-sampling">&mdash;</dd></div>
+          <div><dt>Evidence supports</dt><dd id="hm-target">&mdash;</dd></div>
+          <div><dt>Heatmap file</dt><dd id="hm-file" class="mono">&mdash;</dd></div>
+        </dl>
+        <p class="note" id="context-meta"></p>
+        <p class="note" id="context-caption"></p>
+        <p class="note" id="heatmap-caption"></p>
+        <p class="note" id="game-view-caption"></p>
+        <details class="tech-details" id="masking-details">
+          <summary>Masking diagnostic (technical)</summary>
+          <div id="masking-body"></div>
+        </details>
+      </details>
+
+      <details class="tech-details attribution-summary" id="attribution-summary" hidden>
+        <summary>Attribution summary</summary>
+        <div class="attribution-body">
+          <dl class="meta-grid">
+            <div><dt>Target meaning</dt><dd id="attr-target">&mdash;</dd></div>
+            <div><dt>Highest raw Grad-CAM</dt><dd id="attr-max">&mdash;</dd></div>
+            <div><dt>Temporal bin</dt><dd id="attr-bin">&mdash;</dd></div>
+            <div><dt>Spatial cell</dt><dd id="attr-cell">&mdash;</dd></div>
+          </dl>
+          <p class="note" id="attr-note"></p>
+        </div>
       </details>
     </section>
 
