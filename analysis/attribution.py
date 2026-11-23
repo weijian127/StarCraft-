@@ -38,12 +38,20 @@ def grad_cam(model, inputs, *, target_class=1):
         model.train(was_training)
 
 
-def pivotal_intervals(times, probabilities, *, threshold=0.1, merge_seconds=60):
-    """Find adjacent changes >= threshold and merge events separated by a short gap.
+def pivotal_intervals(times, probabilities, *, threshold=0.1, merge_seconds=120):
+    """Find candidate intervals from adjacent changes.
 
-    Inputs must be deterministic predictions from increasing elapsed cutoffs.
-    Threshold is an absolute probability change (0.1 means ten percentage points).
-    Reports model evidence, not a causal effect or an action recommendation.
+    Every adjacent change with ``abs(delta) >= threshold`` starts a candidate.
+    Two candidates are merged only when all of these hold:
+
+    * they are consecutive in the original timeline (no skipped step);
+    * their directions are the same;
+    * the merged span is at most ``merge_seconds`` long.
+
+    An unqualified step or a reversal always starts a new candidate. The window
+    is a local display rule, not a claim from the paper and not validated as a
+    match-deciding event. Values are probability changes in 0..1 units; the UI
+    reports them as percentage points (0.1 = 10.0 pp).
     """
     import numpy as np
     times = np.asarray(times, dtype=float)
@@ -55,21 +63,44 @@ def pivotal_intervals(times, probabilities, *, threshold=0.1, merge_seconds=60):
             or not np.isfinite(merge_seconds) or merge_seconds < 0):
         raise ValueError("Invalid timeline or pivotal-interval settings")
     events = []
+    last_change_index = None
     for index in range(1, len(times)):
         delta = float(probabilities[index] - probabilities[index - 1])
-        if abs(delta) < threshold:
+        if abs(delta) < threshold - 1e-12:
             continue
-        event = {"start_seconds": float(times[index - 1]), "end_seconds": float(times[index]),
-                 "start_probability": float(probabilities[index - 1]),
-                 "end_probability": float(probabilities[index]), "net_change": delta,
-                 "peak_change": delta, "peak_cutoff_seconds": float(times[index]), "changes": 1}
-        if events and event["start_seconds"] - events[-1]["end_seconds"] <= merge_seconds:
-            previous = events[-1]
-            previous.update(end_seconds=event["end_seconds"], end_probability=event["end_probability"],
-                            net_change=event["end_probability"] - previous["start_probability"],
-                            changes=previous["changes"] + 1)
-            if abs(delta) > abs(previous["peak_change"]):
-                previous.update(peak_change=delta, peak_cutoff_seconds=event["peak_cutoff_seconds"])
+        event = {
+            "start_seconds": float(times[index - 1]),
+            "end_seconds": float(times[index]),
+            "start_probability": float(probabilities[index - 1]),
+            "end_probability": float(probabilities[index]),
+            "net_change": delta,
+            "peak_change": delta,
+            "peak_cutoff_seconds": float(times[index]),
+            "max_step_change": delta,
+            "max_step_cutoff_seconds": float(times[index]),
+            "changes": 1,
+            "first_change_index": index - 1,
+            "last_change_index": index,
+        }
+        previous = events[-1] if events else None
+        consecutive = previous is not None and last_change_index == index - 1
+        same_direction = previous is not None and (
+            (previous["net_change"] > 0 and delta > 0)
+            or (previous["net_change"] < 0 and delta < 0))
+        merged_span = (float(times[index]) - previous["start_seconds"]) if previous else float("inf")
+        if consecutive and same_direction and merged_span <= merge_seconds + 1e-9:
+            previous.update(
+                end_seconds=float(times[index]),
+                end_probability=float(probabilities[index]),
+                net_change=float(probabilities[index]) - previous["start_probability"],
+                changes=previous["changes"] + 1,
+                last_change_index=index,
+            )
+            if abs(delta) > abs(previous["max_step_change"]):
+                previous.update(peak_change=delta, peak_cutoff_seconds=float(times[index]),
+                                max_step_change=delta,
+                                max_step_cutoff_seconds=float(times[index]))
         else:
             events.append(event)
+        last_change_index = index
     return events

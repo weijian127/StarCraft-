@@ -1,5 +1,11 @@
 # SC2 predictor
 
+For the local replay upload, analysis and report service, start with
+[`QUICKSTART.md`](QUICKSTART.md). It lists the verified Python/SC2/team-checkpoint
+prerequisites, the daily startup command, the actual home page and the opt-in
+Cloudflare Quick Tunnel public-demo procedure. The sections below cover dataset extraction,
+training and the offline review exporter.
+
 Install the Python dependencies with `uv sync`.
 
 For an NVIDIA GPU, use `uv sync --extra cuda` (CUDA 12.8 PyTorch wheels). This

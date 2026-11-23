@@ -3,6 +3,11 @@
 .pytest_cache/
 runs/
 __pycache__/
-#data/
+data/processed/
+data_sample/
+checkpoints/
+*.pt
+*.log
+*.pid
 .env
 .idea

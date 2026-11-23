@@ -126,18 +126,42 @@ def test_masking_highlighted_cells_removes_known_signal_and_preserves_inputs():
     assert masking_check(model, {"x": patch}, torch.zeros_like(patch))["available"] is False
 
 
-def test_pivotal_intervals_merge_changes_but_preserve_net_direction():
+def test_pivotal_intervals_do_not_merge_reversals_or_skipped_changes():
     events = pivotal_intervals([0, 60, 120, 180, 300, 360], [.1, .5, .3, .31, .31, .8],
                               threshold=.15, merge_seconds=60)
-    assert len(events) == 2
-    assert events[0]["start_seconds"] == 0 and events[0]["end_seconds"] == 120
-    assert events[0]["net_change"] == pytest.approx(.2)
-    assert events[0]["peak_change"] == pytest.approx(.4) and events[0]["changes"] == 2
+    assert len(events) == 3
+    assert events[0]["start_seconds"] == 0 and events[0]["end_seconds"] == 60
+    assert events[0]["net_change"] == pytest.approx(.4)
+    assert events[1]["start_seconds"] == 60 and events[1]["end_seconds"] == 120
+    assert events[1]["net_change"] == pytest.approx(-.2)
+    assert events[1]["changes"] == 1
+    assert events[2]["start_seconds"] == 300 and events[2]["end_seconds"] == 360
     assert pivotal_intervals([0, 60], [.5, .5]) == []
     with pytest.raises(ValueError):
         pivotal_intervals([60, 60], [.2, .6])
     with pytest.raises(ValueError):
         pivotal_intervals([0, 60], [.2, float("nan")])
+
+
+def test_pivotal_intervals_merge_only_consecutive_same_direction_within_cap():
+    events = pivotal_intervals([0, 60, 120, 180, 240, 300],
+                              [.1, .2, .3, .4, .5, .35],
+                              threshold=.1, merge_seconds=120)
+    assert len(events) == 3
+    assert (events[0]["start_seconds"], events[0]["end_seconds"]) == (0, 120)
+    assert events[0]["changes"] == 2 and events[0]["net_change"] == pytest.approx(.2)
+    assert (events[1]["start_seconds"], events[1]["end_seconds"]) == (120, 240)
+    assert events[1]["changes"] == 2 and events[1]["net_change"] == pytest.approx(.2)
+    assert events[2]["net_change"] == pytest.approx(-.15)
+
+
+def test_pivotal_intervals_do_not_cross_unqualified_step():
+    events = pivotal_intervals([0, 60, 120, 180], [.1, .2, .21, .35],
+                              threshold=.1, merge_seconds=120)
+    assert len(events) == 2
+    assert (events[0]["start_seconds"], events[0]["end_seconds"]) == (0, 60)
+    assert (events[1]["start_seconds"], events[1]["end_seconds"]) == (120, 180)
+    assert events[1]["changes"] == 1
 
 
 def test_metrics_and_per_cutoff_loss_are_sample_weighted():

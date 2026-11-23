@@ -13,6 +13,7 @@ from matplotlib.colors import ListedColormap
 import numpy as np
 import torch
 
+from analysis.adapt_viz import interval_rule
 from analysis.attribution import grad_cam, pivotal_intervals
 from config import resolve_path
 from data_processing.temporal import PrefixReplayDataset
@@ -75,7 +76,7 @@ def time_grid_settings(config, *, min_seconds=None, step_seconds=None, max_secon
 
 
 def build_review(checkpoint_path, output, *, device="auto", sample_id=None, threshold=0.1,
-                 merge_seconds=60, min_seconds=None, step_seconds=None, max_seconds=None):
+                 merge_seconds=120, min_seconds=None, step_seconds=None, max_seconds=None):
     checkpoint_path, output = Path(checkpoint_path), Path(output)
     device = choose_device(device)
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
@@ -175,6 +176,7 @@ def build_review(checkpoint_path, output, *, device="auto", sample_id=None, thre
     report = {"sample_id": sample_id, "replay_id": first["replay_id"], "focus_player_id": first["focus_player_id"],
               "label": int(first["targets"]), "checkpoint": str(checkpoint_path.resolve()), "checkpoint_epoch": checkpoint["epoch"],
               "observation_setting": config["observation_setting"], "threshold": threshold, "merge_seconds": merge_seconds,
+              "interval_rule": interval_rule(threshold, merge_seconds),
               "time_grid": {"training": training_grid, "inference": inference_grid,
                             "override_applied": bool(grid_overridden), "frames": int(config["frames"])},
               "points": points, "pivotal_intervals": intervals, "explanations": explanations,
@@ -231,7 +233,8 @@ def main():
     parser.add_argument("--sample-id")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--threshold", type=float, default=0.1)
-    parser.add_argument("--merge-seconds", type=float, default=60)
+    parser.add_argument("--merge-seconds", type=float, default=120,
+                        help="Maximum span for merging consecutive same-direction interval changes")
     parser.add_argument("--min-seconds", type=float,
                         help="Export-only cutoff grid: first cutoff (default: checkpoint value)")
     parser.add_argument("--step-seconds", type=float,
