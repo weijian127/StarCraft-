@@ -65,7 +65,22 @@
     bindingsReady: false,
     uploading: false,
     modalBound: false,
-    previewTab: 'minimap'  // 'minimap' | 'game' | 'gradcam'
+    previewTab: 'minimap',  // 'minimap' | 'game' | 'gradcam'
+    heatmapCutoff: NaN,     // exact time requested in the Grad-CAM pane
+    prepare: { token: 0, timer: null, controller: null, lastCompleted: -1 },
+    browse: {
+      key: '',            // job/player whose observation index is loaded
+      frames: null,       // { seconds: [...], count }
+      index: -1,          // observation selected on the slider
+      shownIndex: -1,     // observation actually on screen
+      meta: null,         // preview metadata for shownIndex
+      pending: -1,        // observation waiting for the throttle
+      timer: null,
+      controller: null,
+      token: 0,
+      lastAt: 0,
+      jumpCutoff: NaN     // set by a prediction click; consumed by renderDetail
+    }
   };
 
   var modalState = { open: false, scale: 1, x: 0, y: 0, drag: null, trigger: null };
@@ -278,6 +293,7 @@
     show($('report-view'), name === 'report');
     show($('help-panel'), name === 'help');
     if (name !== 'report') { show($('app'), false); }
+    document.body.classList.toggle('mode-report', name === 'report');
   }
 
   function humanRace(race) {
@@ -510,12 +526,14 @@
     });
     $('moment-prev').addEventListener('click', function () { stepMoment(-1); });
     $('moment-next').addEventListener('click', function () { stepMoment(1); });
+    bindFrameScrub();
     bindImageModal();
   }
 
   function goHome() {
     clearJobTimer();
     cancelHeatmapTask();
+    cancelPreparation();
     state.job = null;
     state.mode = 'home';
     setQuery(null, null);
@@ -1120,6 +1138,8 @@
     var reviewDir = new URL('.', jsonUrl);
     var token = ++state.reviewToken;
     cancelHeatmapTask();
+    cancelPreparation();
+    resetFrameBrowse();
     show($('report-error'), false);
     show($('app'), false);
     setText($('pov-note'), 'Loading ' + playerTitle(pov) + '\u2026');
@@ -1239,6 +1259,9 @@
     state.previewTab = 'minimap';
     cancelHeatmapTask();
     cancelGameViewTask();
+    cancelPreparation();
+    state.heatmapCutoff = NaN;
+    resetFrameBrowse();
     showView('report');
     show($('help-panel'), false);
     show($('banner'), false);
@@ -1252,6 +1275,7 @@
     renderChart(points, data);
     renderIntervals(points, data);
     renderStaticNotes(data);
+    renderPredictionTimes();
 
     if (state.isDemo) {
       var banner = $('banner');
@@ -1261,6 +1285,7 @@
     }
 
     selectInitial(points, data);
+    prepareBackgroundExplanations();
     window.removeEventListener('resize', scheduleRedraw);
     window.addEventListener('resize', scheduleRedraw);
   }
@@ -1616,6 +1641,52 @@
     });
   }
 
+  /* Every saved prediction time, in the sidebar's internally scrolling list. */
+  function renderPredictionTimes() {
+    var list = $('prediction-times-list');
+    if (!list) { return; }
+    svgClear(list);
+    var points = pointsOf(state.data);
+    if (!points.length) {
+      var empty = createEl('li', 'prediction-times-empty',
+        'No prediction points are available in this export.');
+      list.appendChild(empty);
+      return;
+    }
+    var info = probabilityContext();
+    points.forEach(function (point, index) {
+      var time = fmtClock(num(point.cutoff_seconds));
+      var probability = pointProbability(point);
+      var button = createEl('button', 'prediction-time-row');
+      button.type = 'button';
+      button.setAttribute('data-index', String(index));
+      button.setAttribute('aria-label', 'Prediction at ' + time + ', ' +
+        subjectDisplay(info) + ' ' + fmtPercent(probability));
+      button.setAttribute('aria-pressed', 'false');
+      button.title = 'Prediction at ' + time + ' \u00b7 ' +
+        subjectDisplay(info) + ' ' + fmtPercent(probability);
+      var timeNode = createEl('span', 'prediction-time-time', time);
+      var probabilityNode = createEl('span', 'prediction-time-prob', fmtPercent(probability));
+      button.appendChild(timeNode);
+      button.appendChild(probabilityNode);
+      button.addEventListener('click', function () { selectPoint(index); });
+      var item = document.createElement('li');
+      item.appendChild(button);
+      list.appendChild(item);
+    });
+    updatePredictionTimeSelection();
+  }
+
+  function updatePredictionTimeSelection() {
+    var list = $('prediction-times-list');
+    if (!list) { return; }
+    Array.prototype.forEach.call(list.querySelectorAll('.prediction-time-row'), function (node) {
+      var selected = Number(node.getAttribute('data-index')) === state.selected;
+      node.classList.toggle('is-selected', selected);
+      node.setAttribute('aria-pressed', selected ? 'true' : 'false');
+    });
+  }
+
   /* Redraw only the selection overlay and the "is-selected" classes. */
   function updateChartSelection() {
     var svg = $('chart');
@@ -1630,6 +1701,7 @@
     Array.prototype.forEach.call(svg.querySelectorAll('rect.band'), function (node) {
       node.classList.toggle('is-selected', Number(node.getAttribute('data-interval')) === state.selectedInterval);
     });
+    updatePredictionTimeSelection();
 
     if (state.selected < 0 || !points[state.selected]) { return; }
     var layout = chartLayout();
@@ -1668,6 +1740,378 @@
       updateChartSelection();
     }, 150);
   }
+
+  /* ------------------------------------------------------------------ *
+   * Replay minimap browsing (backend preview API)
+   * ------------------------------------------------------------------ */
+
+  var FRAME_MIN_INTERVAL_MS = 60;  // throttle during a drag (leading + trailing)
+
+  function browseRequestContext() {
+    if (state.mode !== 'report' || state.isDemo || !isBackendReport()) { return null; }
+    if (!state.job || !state.job.id || !state.job.player || !state.job.index) { return null; }
+    return { jobId: state.job.id, player: state.job.player };
+  }
+
+  function resetFrameBrowse() {
+    var b = state.browse;
+    if (b.timer) { clearTimeout(b.timer); b.timer = null; }
+    if (b.controller && typeof b.controller.abort === 'function') { b.controller.abort(); }
+    b.controller = null;
+    b.token += 1;
+    b.key = '';
+    b.frames = null;
+    b.index = -1;
+    b.shownIndex = -1;
+    b.meta = null;
+    b.pending = -1;
+    b.lastAt = 0;
+    b.jumpCutoff = NaN;
+    var image = $('frame-image');
+    if (image) {
+      image.onload = null;
+      image.onerror = null;
+      image.removeAttribute('src');
+    }
+    show($('frame-figure'), false);
+    show($('frame-legend'), false);
+    show($('frame-scrub'), false);
+    show($('frame-error'), false);
+    show($('frame-empty'), false);
+    setText($('frame-empty'), '');
+    setText($('frame-browse-time'), '\u2014');
+    setText($('frame-browse-index'), '\u2014');
+    setText($('frame-shown-time'), '\u2014');
+    setText($('frame-shown-index'), '\u2014');
+    setText($('frame-prob'), '');
+    setText($('frame-caption'), '');
+    setText($('tech-browse'), '\u2014');
+  }
+
+  /* Number of every saved observation plus its TimeInfo timestamps. */
+  function loadFrameIndex(context, done) {
+    var b = state.browse;
+    var key = context.jobId + '/' + context.player;
+    if (b.frames && b.key === key) { done(); return; }
+    resetFrameBrowse();
+    b.key = key;
+    var token = b.token;
+    show($('frame-empty'), true);
+    setText($('frame-empty'), 'Loading saved observations\u2026');
+    fetch('/api/jobs/' + encodeURIComponent(context.jobId) + '/frames?player=' +
+      encodeURIComponent(context.player), { cache: 'no-store' })
+      .then(function (response) {
+        return readJson(response).then(function (payload) {
+          if (!response.ok) {
+            throw new ApiError(response.status, payload,
+              'Saved observations are not available for this POV.');
+          }
+          return payload;
+        });
+      })
+      .then(function (payload) {
+        if (token !== b.token || b.key !== key) { return; }
+        var seconds = Array.isArray(payload && payload.frame_seconds)
+          ? payload.frame_seconds.map(Number) : [];
+        if (!seconds.length || !seconds.every(Number.isFinite)) {
+          throw new Error('the server returned no saved observation times');
+        }
+        b.frames = { seconds: seconds, count: seconds.length };
+        var slider = $('frame-slider');
+        if (slider) {
+          slider.min = '0';
+          slider.max = String(seconds.length - 1);
+          slider.step = '1';
+          slider.value = '0';
+        }
+        setText($('frame-start'), fmtClock(seconds[0]));
+        setText($('frame-end'), fmtClock(seconds[seconds.length - 1]));
+        show($('frame-empty'), false);
+        show($('frame-scrub'), true);
+        done();
+      })
+      .catch(function (error) {
+        if (token !== b.token || b.key !== key) { return; }
+        b.frames = null;
+        show($('frame-scrub'), false);
+        show($('frame-empty'), true);
+        setText($('frame-empty'), 'Replay minimap browsing is not available: ' +
+          (error && error.message ? error.message : 'the request failed') + '.');
+      });
+  }
+
+  function browseSeconds(index) {
+    var b = state.browse;
+    if (!b.frames || index < 0 || index >= b.frames.count) { return NaN; }
+    return num(b.frames.seconds[index]);
+  }
+
+  /* The slider shows the requested observation; the image label only changes once
+   * that exact frame has actually loaded. */
+  function setBrowseIndex(index, load) {
+    var b = state.browse;
+    if (!b.frames) { return; }
+    index = Math.min(Math.max(Math.round(index), 0), b.frames.count - 1);
+    b.index = index;
+    var slider = $('frame-slider');
+    if (slider && String(slider.value) !== String(index)) { slider.value = String(index); }
+    updateBrowseReadout();
+    if (load !== false) { queueFrame(index); }
+  }
+
+  function updateBrowseReadout() {
+    var b = state.browse;
+    var seconds = browseSeconds(b.index);
+    setText($('frame-browse-time'), Number.isFinite(seconds) ? fmtClock(seconds) : '\u2014');
+    setText($('frame-browse-index'), Number.isFinite(seconds) ? String(b.index) : '\u2014');
+    var slider = $('frame-slider');
+    if (slider) {
+      slider.setAttribute('aria-valuetext', Number.isFinite(seconds)
+        ? fmtClock(seconds) + ', observation ' + (b.index + 1) + ' of ' + b.frames.count
+        : 'saved observations are loading');
+    }
+    if (!Number.isFinite(seconds)) {
+      setText($('frame-prob'), '');
+      return;
+    }
+    var best = null;
+    pointsOf(state.data).forEach(function (point) {
+      var cutoff = num(point.cutoff_seconds);
+      if (!Number.isFinite(cutoff) || cutoff > seconds + EPSILON) { return; }
+      if (!best || cutoff > num(best.cutoff_seconds)) { best = point; }
+    });
+    if (!best) {
+      setText($('frame-prob'), 'No prediction before this time.');
+      return;
+    }
+    setText($('frame-prob'), 'Prediction at ' + fmtClock(num(best.cutoff_seconds)) + ' \u00b7 ' +
+      subjectDisplay() + ' ' + fmtPercent(pointProbability(best)) +
+      ' \u00b7 nearest earlier prediction, not a per-frame prediction');
+  }
+
+  function queueFrame(index) {
+    var b = state.browse;
+    if (!b.frames) { return; }
+    b.pending = index;
+    pumpFrames();
+  }
+
+  /* Leading + trailing throttle: the first move loads immediately and later
+   * pointer events merge into one request per interval instead of waiting for
+   * the drag to stop. */
+  function pumpFrames() {
+    var b = state.browse;
+    if (b.timer || b.pending < 0) { return; }
+    var wait = Math.max(0, FRAME_MIN_INTERVAL_MS - (Date.now() - b.lastAt));
+    if (wait > 0) {
+      b.timer = setTimeout(function () {
+        b.timer = null;
+        pumpFrames();
+      }, wait);
+      return;
+    }
+    sendFrame(b.pending);
+  }
+
+  function sendFrame(index) {
+    var b = state.browse;
+    var context = browseRequestContext();
+    if (!context || !b.frames) { return; }
+    b.pending = -1;
+    if (index === b.shownIndex && b.meta) { return; }
+    if (b.controller && typeof b.controller.abort === 'function') { b.controller.abort(); }
+    var controller = typeof AbortController === 'function' ? new AbortController() : null;
+    b.controller = controller;
+    var token = ++b.token;
+    var key = b.key;
+    var options = { cache: 'no-store' };
+    if (controller) { options.signal = controller.signal; }
+    b.lastAt = Date.now();
+    var url = '/api/jobs/' + encodeURIComponent(context.jobId) + '/preview?player=' +
+      encodeURIComponent(context.player) + '&frame=' + encodeURIComponent(String(index));
+    fetch(url, options)
+      .then(function (response) {
+        return readJson(response).then(function (payload) {
+          if (!response.ok) {
+            throw new ApiError(response.status, payload,
+              'That saved observation could not be rendered.');
+          }
+          return payload;
+        });
+      })
+      .then(function (payload) {
+        if (token !== b.token || key !== b.key) { return; }
+        b.controller = null;
+        if (!payload || typeof payload.image_url !== 'string') {
+          throw new Error('the preview response did not include an image');
+        }
+        if (num(payload.frame_index) !== index) {
+          throw new Error('the server returned another observation');
+        }
+        showFrameImage(payload, index, token);
+      })
+      .catch(function (error) {
+        if (token !== b.token || key !== b.key) { return; }
+        if (error && error.name === 'AbortError') { return; }
+        show($('frame-error'), true);
+        setText($('frame-error'), 'Replay minimap frame ' + index +
+          ' could not be loaded: ' +
+          (error && error.message ? error.message : 'the request failed') + '.');
+        updateSelectionImage();
+      });
+  }
+
+
+  /* Swap in the image, then move the time labels: while a frame is loading the
+   * previous image keeps its own (still correct) time label. */
+  function showFrameImage(payload, index, token) {
+    var b = state.browse;
+    var figure = $('frame-figure');
+    var legend = $('frame-legend');
+    var empty = $('frame-empty');
+    var image = $('frame-image');
+    var imageUrl;
+    try {
+      imageUrl = new URL(payload.image_url, window.location.origin);
+    } catch (error) {
+      show($('frame-error'), true);
+      setText($('frame-error'), 'The replay minimap path is not a valid URL.');
+      return;
+    }
+    var seconds = num(payload.frame_seconds);
+    var loop = num(payload.game_loop);
+    image.alt = 'Replay minimap of the saved observation at frame ' + index +
+      (Number.isFinite(seconds) ? ', ' + fmtClock(seconds) : '');
+    image.onload = function () {
+      if (token !== b.token) { return; }
+      if (index !== b.index) { return; }
+      b.shownIndex = index;
+      b.meta = payload;
+      show(figure, true);
+      show(legend, true);
+      show(empty, false);
+      show($('frame-error'), false);
+      setText($('frame-shown-time'), Number.isFinite(seconds) ? fmtClock(seconds) : '\u2014');
+      setText($('frame-shown-index'), String(index));
+      setText($('frame-caption'), 'Replay minimap of saved observation ' + index +
+        (Number.isFinite(seconds) ? ' at ' + fmtClock(seconds) : '') +
+        ' from this POV\'s TimeInfo and spatial features. Static observations are allowed; ' +
+        'this frame is not necessarily a model input sample.');
+      setText($('tech-browse'), 'frame ' + index + ' \u00b7 ' +
+        (Number.isFinite(seconds) ? fmtClock(seconds) : 'time not recorded') +
+        (Number.isFinite(loop) ? ' (game loop ' + trimNum(loop, 0) + ')' : '') +
+        ', saved observation from TimeInfo; not a model sample');
+      updateSelectionImage();
+    };
+    image.onerror = function () {
+      if (token !== b.token) { return; }
+      show($('frame-error'), true);
+      setText($('frame-error'), 'Replay minimap image could not be loaded.');
+      updateSelectionImage();
+    };
+    image.src = imageUrl.href;
+  }
+
+  function nearestFrameAtOrBefore(seconds) {
+    var b = state.browse;
+    if (!b.frames) { return 0; }
+    var list = b.frames.seconds;
+    var low = 0;
+    var high = list.length - 1;
+    var best = 0;
+    while (low <= high) {
+      var mid = Math.floor((low + high) / 2);
+      if (list[mid] <= seconds + EPSILON) { best = mid; low = mid + 1; }
+      else { high = mid - 1; }
+    }
+    return best;
+  }
+
+  function jumpToPredictionFrame(cutoff, explanation) {
+    var b = state.browse;
+    var context = browseRequestContext();
+    if (!b.frames || !context) { return; }
+    var frame = explanation && explanation.context_frame
+      ? num(explanation.context_frame.frame_index) : NaN;
+    if (Number.isFinite(frame)) {
+      setBrowseIndex(frame);
+      return;
+    }
+    var token = b.token;
+    var key = b.key;
+    var url = '/api/jobs/' + encodeURIComponent(context.jobId) + '/preview?player=' +
+      encodeURIComponent(context.player) + '&cutoff=' + encodeURIComponent(String(cutoff));
+    fetch(url, { cache: 'no-store' })
+      .then(function (response) {
+        return readJson(response).then(function (payload) {
+          if (!response.ok) { throw new Error('no saved frame for this cutoff'); }
+          return payload;
+        });
+      })
+      .then(function (payload) {
+        if (token !== b.token || key !== b.key || !b.frames) { return; }
+        var index = num(payload && payload.frame_index);
+        setBrowseIndex(Number.isFinite(index) ? index : nearestFrameAtOrBefore(cutoff));
+      })
+      .catch(function () {
+        if (token !== b.token || key !== b.key || !b.frames) { return; }
+        setBrowseIndex(nearestFrameAtOrBefore(cutoff));
+      });
+  }
+
+  /* Called from renderDetail(). A prediction click sets browse.jumpCutoff so the
+   * slider follows the selection; ordinary re-renders keep the browsed frame. */
+  function renderFrameBrowse(cutoff, explanation) {
+    var b = state.browse;
+    var context = browseRequestContext();
+    if (!context) {
+      if (b.key) { resetFrameBrowse(); }
+      show($('frame-figure'), false);
+      show($('frame-legend'), false);
+      show($('frame-scrub'), false);
+      show($('frame-error'), false);
+      show($('frame-empty'), true);
+      setText($('frame-empty'), state.isDemo
+        ? 'Replay minimap browsing needs the local preview API. This demo ships a static export.'
+        : 'Saved replay observations are not available in this export.');
+      setText($('tech-browse'), 'not available in this export');
+      return;
+    }
+    var jump = b.jumpCutoff;
+    b.jumpCutoff = NaN;
+    loadFrameIndex(context, function () {
+      if (!b.frames) { return; }
+      if (Number.isFinite(jump)) {
+        jumpToPredictionFrame(jump, explanation);
+      } else if (b.index < 0) {
+        jumpToPredictionFrame(cutoff, explanation);
+      } else {
+        updateBrowseReadout();
+      }
+    });
+  }
+
+  function bindFrameScrub() {
+    var slider = $('frame-slider');
+    if (!slider || slider.getAttribute('data-bound') === '1') { return; }
+    slider.setAttribute('data-bound', '1');
+    slider.addEventListener('input', function () {
+      var b = state.browse;
+      if (!b.frames) { return; }
+      var index = parseInt(slider.value, 10);
+      if (!Number.isFinite(index)) { return; }
+      b.index = Math.min(Math.max(index, 0), b.frames.count - 1);
+      updateBrowseReadout();
+      var seconds = browseSeconds(b.index);
+      if (Number.isFinite(seconds)) {
+        state.heatmapCutoff = seconds;
+        if (state.previewTab === 'gradcam') { refreshGradcam(seconds); }
+      }
+      queueFrame(b.index);
+    });
+  }
+
+
 
   /* ------------------------------------------------------------------ *
    * Candidate pivotal intervals
@@ -1843,6 +2287,8 @@
     cancelHeatmapTask();
     state.selectedInterval = index;
     state.selected = findPointIndex(pointsOf(data), num(interval.peak_cutoff_seconds));
+    state.heatmapCutoff = num(interval.peak_cutoff_seconds);
+    state.browse.jumpCutoff = num(interval.peak_cutoff_seconds);
     syncIntervalButtons();
     syncMomentNav();
     updateChartSelection();
@@ -1857,6 +2303,8 @@
     var cutoff = num(point.cutoff_seconds);
     state.selected = index;
     state.selectedInterval = -1;
+    state.heatmapCutoff = cutoff;
+    state.browse.jumpCutoff = cutoff;
     intervalsOf(data).forEach(function (interval, intervalIndex) {
       if (Math.abs(num(interval.peak_cutoff_seconds) - cutoff) < EPSILON) { state.selectedInterval = intervalIndex; }
     });
@@ -1908,6 +2356,12 @@
     return NaN;
   }
 
+  /* The Grad-CAM pane has its own requested time: a clicked prediction uses its
+   * saved cutoff, while moving the minimap slider requests that browsing time. */
+  function currentHeatmapCutoff() {
+    return Number.isFinite(state.heatmapCutoff) ? state.heatmapCutoff : currentCutoff();
+  }
+
   function clearSelectionStrip() {
     setText($('sel-time'), '\u2014');
     setText($('sel-subject'), '\u2014');
@@ -1932,6 +2386,9 @@
       renderGameView(null, imageToken);
       renderHeatmapOnDemand(NaN);
       renderMasking();
+      resetFrameBrowse();
+      state.heatmapCutoff = NaN;
+      setText($('tech-reference'), '\u2014');
       syncMomentNav();
       syncPreview();
       return;
@@ -1940,6 +2397,7 @@
     show($('detail'), true);
 
     var cutoff = currentCutoff();
+    var heatmapCutoff = currentHeatmapCutoff();
     var point = hasPoint ? points[state.selected] : null;
     var interval = hasInterval ? intervals[state.selectedInterval] : null;
     var info = probabilityContext();
@@ -1947,7 +2405,7 @@
       ? pointProbability(point)
       : num(interval ? interval.end_probability : NaN);
     var subject = subjectDisplay(info);
-    var explanation = findExplanation(data, cutoff);
+    var explanation = findExplanation(data, heatmapCutoff);
 
     /* Only the probability of the current focus object is shown. The complement
      * is not the other POV's prediction and is deliberately not displayed. */
@@ -1957,10 +2415,25 @@
     setText($('readout'), 'Cutoff ' + fmtClock(cutoff) + ' \u2014 ' + subject + ' ' +
       (Number.isFinite(probability) ? fmtPercent(probability) : 'not provided'));
 
-    renderHeatmap(cutoff, imageToken);
-    renderContext(cutoff, explanation, imageToken);
+    renderHeatmap(heatmapCutoff, imageToken);
+    renderContext(heatmapCutoff, explanation, imageToken);
     renderGameView(explanation, imageToken);
-    renderHeatmapOnDemand(cutoff);
+    if (explanation) {
+      var frameInfo = explanation.context_frame && typeof explanation.context_frame === 'object'
+        ? explanation.context_frame : null;
+      var frameSeconds = frameInfo ? num(frameInfo.frame_seconds) : NaN;
+      setText($('tech-reference'), Number.isFinite(frameSeconds)
+        ? 'cutoff ' + fmtClock(cutoff) + ' \u2192 sampled frame ' + fmtClock(frameSeconds) +
+          (frameInfo.game_loop !== undefined && frameInfo.game_loop !== null
+            ? ' (game loop ' + trimNum(num(frameInfo.game_loop), 0) + ')' : '') +
+          ', ' + samplingSourceText(frameInfo.source)
+        : 'not recorded; this explanation does not name its reference frame');
+    } else {
+      setText($('tech-reference'),
+        'no Grad-CAM at this cutoff; its prediction input frame is not recorded');
+    }
+    renderFrameBrowse(cutoff, explanation);
+    renderHeatmapOnDemand(heatmapCutoff);
     renderMasking();
     syncMomentNav();
     syncPreview();
@@ -1970,6 +2443,9 @@
   function setPreviewTab(tab, focus) {
     if (['minimap', 'game', 'gradcam'].indexOf(tab) < 0) { return; }
     state.previewTab = tab;
+    if (tab === 'gradcam' && Number.isFinite(state.heatmapCutoff)) {
+      refreshGradcam(state.heatmapCutoff);
+    }
     syncPreview();
     if (focus) {
       var node = $('tab-' + tab);
@@ -1994,7 +2470,7 @@
 
   function updateSelectionImage() {
     var data = state.data;
-    var cutoff = data ? currentCutoff() : NaN;
+    var cutoff = data ? currentHeatmapCutoff() : NaN;
     var explanation = data ? findExplanation(data, cutoff) : null;
     var text = '';
     if (!Number.isFinite(cutoff)) {
@@ -2002,12 +2478,19 @@
       return;
     }
     if (state.previewTab === 'minimap') {
-      var frame = explanation && explanation.context_frame && typeof explanation.context_frame === 'object'
-        ? explanation.context_frame : null;
-      var seconds = frame ? num(frame.frame_seconds) : NaN;
-      text = 'Minimap \u00b7 ' + (Number.isFinite(seconds)
-        ? 'context image time ' + fmtClock(seconds)
-        : 'no recorded context image time');
+      var b = state.browse;
+      if (!b.frames && !browseRequestContext()) {
+        text = 'Replay minimap \u00b7 no saved observations in this export';
+      } else if (!b.frames && browseRequestContext()) {
+        text = 'Replay minimap \u00b7 loading saved observations';
+      } else if (b.meta && Number.isFinite(num(b.meta.frame_seconds))) {
+        text = 'Replay minimap \u00b7 showing frame ' + fmtClock(num(b.meta.frame_seconds)) +
+          ' (observation ' + b.shownIndex + ')' +
+          (b.index !== b.shownIndex && Number.isFinite(browseSeconds(b.index))
+            ? ' \u00b7 browsing ' + fmtClock(browseSeconds(b.index)) : '');
+      } else {
+        text = 'Replay minimap \u00b7 loading frame ' + b.index;
+      }
     } else if (state.previewTab === 'game') {
       var view = explanation && explanation.game_view && typeof explanation.game_view === 'object'
         ? explanation.game_view : null;
@@ -2019,11 +2502,28 @@
       var observed = explanation ? num(explanation.displayed_frame_seconds) : NaN;
       var meaning = explanation && explanation.target_meaning
         ? String(explanation.target_meaning) : '';
-      text = 'Grad-CAM \u00b7 cutoff ' + fmtClock(cutoff) +
+      var generation = explanation && explanation.generation && typeof explanation.generation === 'object'
+        ? explanation.generation : {};
+      text = 'Grad-CAM \u00b7 explanation cutoff ' + fmtClock(cutoff) +
+        (generation.custom_cutoff === true ? ' (custom browsing time)' : '') +
         (Number.isFinite(observed) ? ', image time ' + fmtClock(observed) : '') +
-        (meaning ? ' \u00b7 class: ' + meaning : '');
+        (meaning ? ' \u00b7 class: ' + meaning : '') +
+        (explanation ? '' : ' \u00b7 not generated yet');
     }
     setText($('sel-image'), text);
+  }
+
+  /* Re-render only the Grad-CAM pane for a new requested time. Slider movement
+   * calls this without ever starting a generation. */
+  function refreshGradcam(cutoff) {
+    var token = ++state.imageToken;
+    var explanation = state.data ? findExplanation(state.data, cutoff) : null;
+    renderHeatmap(cutoff, token);
+    renderContext(cutoff, explanation, token);
+    renderGameView(explanation, token);
+    renderHeatmapOnDemand(cutoff);
+    renderMasking();
+    updateSelectionImage();
   }
 
   function renderHeatmap(cutoff, imageToken) {
@@ -2046,6 +2546,7 @@
     setText($('heatmap-caption'), '');
     setText($('hm-cutoff'), 'n/a');
     setText($('hm-observed'), 'n/a');
+    setText($('hm-probability'), 'n/a');
     setText($('hm-target'), 'n/a');
     setText($('hm-file'), 'n/a');
     setText($('hm-sampling'), 'n/a');
@@ -2053,11 +2554,21 @@
 
     if (!explanation) {
       var explanations = explanationsOf(data);
+      var savedPoint = findPointIndex(pointsOf(data), cutoff) >= 0;
+      var missingLabel = fmtClock(cutoff) + (savedPoint ? '' : ' (' + fmtSeconds(cutoff) + ')');
       show(missing, true);
-      setText(missing, explanations.length
-        ? 'No pre-generated heatmap for this cutoff. Existing heatmaps: ' +
-          describeCutoffs(explanations) + '.'
-        : 'No heatmap has been generated for this cutoff.');
+      if (isBackendReport()) {
+        setText(missing, 'No exact heatmap at ' + missingLabel +
+          '. Use “Generate heatmap at ' + missingLabel + '” below. ' +
+          (savedPoint
+            ? 'This saved cutoff has no cached explanation yet.'
+            : 'This is a custom browsing time; no curve point will be added.'));
+      } else {
+        setText(missing, explanations.length
+          ? 'No pre-generated heatmap for this cutoff. Existing heatmaps: ' +
+            describeCutoffs(explanations) + '.'
+          : 'No heatmap has been generated for this cutoff.');
+      }
       return;
     }
 
@@ -2074,23 +2585,45 @@
       ? explanation.generation : {};
     var nativeBins = num(generation.native_temporal_bins);
     if (!Number.isFinite(nativeBins)) { nativeBins = num(explanation.native_temporal_bins); }
+    var heatmapProbability = num(generation.probability);
+    if (!Number.isFinite(heatmapProbability) && Array.isArray(explanation.class_probabilities)
+        && explanation.class_probabilities.length === 2) {
+      heatmapProbability = num(explanation.class_probabilities[1]);
+    }
+    var probabilitySource = generation.probability_source ||
+      (generation.custom_cutoff === true ? 'inference' : 'saved_timeline');
+    var customCutoff = generation.custom_cutoff === true;
 
-    /* Prediction cutoff and image observation time are separate fields; report each one
-     * only when the export actually records it. */
-    setText($('hm-cutoff'), fmtSeconds(explanationCutoff) + ' (' + fmtClock(explanationCutoff) + ')');
+    /* Explanation cutoff and image observation time are separate fields; report each
+     * one only when the export actually records it. */
+    setText($('hm-cutoff'), fmtSeconds(explanationCutoff) + ' (' + fmtClock(explanationCutoff) + ')' +
+      (customCutoff ? ' \u00b7 custom browsing time' : ''));
     setText($('hm-observed'), Number.isFinite(observed)
       ? fmtSeconds(observed) + ' (' + fmtClock(observed) + ')'
-      : 'not recorded; only the prediction cutoff is known');
+      : 'not recorded; the heatmap covers the sampled history up to its cutoff');
+    setText($('hm-probability'), Number.isFinite(heatmapProbability)
+      ? fmtPercent(heatmapProbability) + (probabilitySource === 'inference'
+        ? ' (this inference; not copied from the curve)'
+        : ' (matches the saved timeline point)')
+      : 'not recorded');
     setText($('hm-target'), (targetMeaning
       ? 'Heatmap class: ' + targetMeaning + ' (target_class ' + String(target) + ') \u2014 evidence for ' + side
       : 'Evidence supporting ' + side + ' (target_class ' + String(target) + ')'));
     setText($('hm-file'), explanation.image ? String(explanation.image) : 'not provided');
-    setText($('heatmap-status'), Number.isFinite(observed)
-      ? 'The prediction cutoff limits which frames the model could see; the image observation time is the frame ' +
-        'that was upsampled for this heatmap. They are independent fields in review.json.'
-      : 'The prediction cutoff is recorded. This export does not name the displayed frame, so the ' +
-        'observation time is unavailable rather than zero. The map covers sampled history, not one exact frame.');
-    setText($('heatmap-caption'), 'Prediction cutoff ' + fmtSeconds(explanationCutoff) +
+    if (customCutoff) {
+      setText($('heatmap-status'),
+        'Requested browsing time ' + fmtClock(explanationCutoff) +
+        ': the map explains the sampled history up to this time. The probability shown above ' +
+        'comes from this inference, not from a nearby curve point. No curve point was added.');
+    } else {
+      setText($('heatmap-status'), Number.isFinite(observed)
+        ? 'The explanation cutoff limits which frames the model could see; the image observation time is the frame ' +
+          'that was upsampled for this heatmap. They are independent fields in review.json.'
+        : 'The explanation cutoff is recorded. This export does not name the displayed frame, so the ' +
+          'observation time is unavailable rather than zero. The map covers sampled history, not one exact frame.');
+    }
+    setText($('heatmap-caption'), (customCutoff ? 'Custom browsing time ' : 'Explanation cutoff ') +
+      fmtSeconds(explanationCutoff) +
       (Number.isFinite(observed) ? '; image observation time ' + fmtSeconds(observed) : '') +
       '. ' + (targetMeaning
         ? 'The heatmap class is "' + targetMeaning + '" (target_class ' + String(target) + '), evidence for ' + side + '.'
@@ -2119,7 +2652,7 @@
     }
 
     image.alt = 'Grad-CAM heatmap showing ' + (targetMeaning ? 'the class "' + targetMeaning + '"' : 'evidence supporting ' + side) +
-      ' at prediction cutoff ' + fmtSeconds(explanationCutoff);
+      ' at explanation cutoff ' + fmtSeconds(explanationCutoff);
     image.onload = function () {
       if (imageToken !== state.imageToken) { return; }
       show(figure, true);
@@ -2207,7 +2740,7 @@
         ' \u00b7 ' + samplingSourceText(source)
       : 'not recorded in this export');
     setText($('context-meta'),
-      'POV: ' + povLabel + '. Prediction cutoff: ' + prediction + '. ' +
+      'POV: ' + povLabel + '. Explanation cutoff: ' + prediction + '. ' +
       'Sampled observation range: ' + range + '. ' +
       'Context image time: ' + (Number.isFinite(contextSeconds)
         ? fmtClock(contextSeconds) + (Number.isFinite(contextLoop) ? ' (game loop ' + trimNum(contextLoop, 0) + ')' : '')
@@ -2336,9 +2869,10 @@
     if (state.modalBound) { return; }
     state.modalBound = true;
     var contextImage = $('context-image');
+    var frameImage = $('frame-image');
     var heatmapImage = $('heatmap-image');
     var gameViewImage = $('game-view-image');
-    [contextImage, heatmapImage, gameViewImage].forEach(function (node) {
+    [contextImage, frameImage, heatmapImage, gameViewImage].forEach(function (node) {
       if (!node) { return; }
       node.addEventListener('click', function () {
         openImageModal(node, imageModalTitle(node));
@@ -2409,6 +2943,7 @@
 
   function imageModalTitle(node) {
     if (node.id === 'context-image') { return 'Model-input minimap visualization'; }
+    if (node.id === 'frame-image') { return 'Replay minimap'; }
     if (node.id === 'game-view-image') { return 'Re-rendered game view'; }
     return 'Grad-CAM heatmap';
   }
@@ -2418,7 +2953,9 @@
     if (!source) { return; }
     var captionNode = trigger.id === 'context-image'
       ? $('context-caption')
-      : (trigger.id === 'game-view-image' ? $('game-view-caption') : $('heatmap-caption'));
+      : (trigger.id === 'game-view-image'
+        ? $('game-view-caption')
+        : (trigger.id === 'frame-image' ? $('frame-caption') : $('heatmap-caption')));
     var image = $('image-modal-image');
     image.src = source;
     image.alt = trigger.alt || '';
@@ -2649,6 +3186,144 @@
     return state.mode === 'report' && state.job && state.job.id && state.job.player && !state.isDemo;
   }
 
+  /* ------------------------------------------------------------------ *
+   * Background preparation of the top candidate explanations
+   * ------------------------------------------------------------------ */
+
+  function cancelPreparation() {
+    var prepare = state.prepare;
+    if (prepare.timer) {
+      clearTimeout(prepare.timer);
+      prepare.timer = null;
+    }
+    if (prepare.controller && typeof prepare.controller.abort === 'function') {
+      prepare.controller.abort();
+    }
+    prepare.controller = null;
+    prepare.token += 1;
+    prepare.lastCompleted = -1;
+  }
+
+  function prepareBackgroundExplanations() {
+    if (!isBackendReport()) { return; }
+    cancelPreparation();
+    var prepare = state.prepare;
+    var token = prepare.token;
+    var jobId = state.job.id;
+    var player = state.job.player;
+    var controller = typeof AbortController === 'function' ? new AbortController() : null;
+    prepare.controller = controller;
+    var options = {
+      method: 'POST',
+      cache: 'no-store',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ player: player })
+    };
+    if (controller) { options.signal = controller.signal; }
+    fetch('/api/jobs/' + encodeURIComponent(jobId) + '/explanations/prepare', options)
+      .then(function (response) {
+        return readJson(response).then(function (payload) {
+          if (!response.ok) {
+            throw new ApiError(response.status, payload,
+              'Background explanation preparation was not started.');
+          }
+          return payload;
+        });
+      })
+      .then(function (payload) {
+        if (token !== prepare.token || !state.job || state.job.id !== jobId
+            || state.job.player !== player) { return; }
+        prepare.controller = null;
+        prepare.lastCompleted = Number(payload.completed) || 0;
+        var known = 0;
+        (payload.candidates || []).forEach(function (candidate) {
+          if (findExplanation(state.data, num(candidate.cutoff_seconds))) { known += 1; }
+        });
+        if (prepare.lastCompleted > known && !state.heatmapTask) {
+          prepare.lastCompleted = known;
+          refreshReviewFromBackground(jobId, player);
+        }
+        if ((Number(payload.pending) || 0) > 0) {
+          schedulePreparationPoll(token, jobId, player, 2500);
+        }
+      })
+      .catch(function () {
+        if (token === prepare.token) { prepare.controller = null; }
+      });
+  }
+
+  function schedulePreparationPoll(token, jobId, player, delay) {
+    var prepare = state.prepare;
+    if (token !== prepare.token) { return; }
+    clearTimeout(prepare.timer);
+    prepare.timer = setTimeout(function () {
+      prepare.timer = null;
+      fetchPreparationStatus(token, jobId, player);
+    }, delay);
+  }
+
+  function fetchPreparationStatus(token, jobId, player) {
+    var prepare = state.prepare;
+    if (token !== prepare.token || !state.job || state.job.id !== jobId
+        || state.job.player !== player) { return; }
+    fetch('/api/jobs/' + encodeURIComponent(jobId) + '/explanations/prepare?player=' +
+      encodeURIComponent(player), { cache: 'no-store' })
+      .then(function (response) {
+        return readJson(response).then(function (payload) {
+          if (!response.ok) { throw new ApiError(response.status, payload,
+            'Preparation status could not be read.'); }
+          return payload;
+        });
+      })
+      .then(function (payload) {
+        if (token !== prepare.token || !state.job || state.job.id !== jobId
+            || state.job.player !== player) { return; }
+        var completed = Number(payload.completed) || 0;
+        var pending = Number(payload.pending) || 0;
+        if (completed > prepare.lastCompleted && !state.heatmapTask
+            && !state.isDemo && state.mode === 'report') {
+          prepare.lastCompleted = completed;
+          refreshReviewFromBackground(jobId, player);
+        }
+        if (pending > 0 || (completed > prepare.lastCompleted && state.heatmapTask)) {
+          schedulePreparationPoll(token, jobId, player, 3000);
+        }
+      })
+      .catch(function () {
+        if (token === prepare.token) {
+          schedulePreparationPoll(token, jobId, player, 5000);
+        }
+      });
+  }
+
+  function refreshReviewFromBackground(jobId, player) {
+    if (!state.jsonUrl) { return; }
+    var token = ++state.reviewToken;
+    fetch(state.jsonUrl.href, { cache: 'no-store' })
+      .then(function (response) {
+        if (!response.ok) { throw new Error('HTTP ' + response.status); }
+        return response.json();
+      })
+      .then(function (data) {
+        if (token !== state.reviewToken || state.mode !== 'report' || !state.job) { return; }
+        if (state.job.id !== jobId || state.job.player !== player) { return; }
+        if (!data || typeof data !== 'object' || Array.isArray(data)) { return; }
+        state.data = data;
+        state.info = probabilityInfo(data);
+        renderMeta(data);
+        renderRunInfo(data);
+        var points = pointsOf(data);
+        renderChart(points, data);
+        renderIntervals(points, data);
+        renderStaticNotes(data);
+        syncIntervalButtons();
+        syncMomentNav();
+        updateChartSelection();
+        renderDetail();
+      })
+      .catch(function () { /* the existing report stays readable */ });
+  }
+
   function cancelHeatmapTask() {
     closeImageModal();
     cancelGameViewTask();
@@ -2677,6 +3352,8 @@
     var status = $('heatmap-generate-status');
     var error = $('heatmap-generate-error');
     var explanation = findExplanation(state.data, cutoff);
+    var isSavedPoint = findPointIndex(pointsOf(state.data), cutoff) >= 0;
+    var cutoffLabel = fmtClock(cutoff) + (isSavedPoint ? '' : ' (' + fmtSeconds(cutoff) + ')');
 
     show(box, false);
     show(error, false);
@@ -2684,6 +3361,7 @@
     show(retry, false);
     show(generate, true);
     generate.disabled = false;
+    setText(generate, 'Generate heatmap at ' + cutoffLabel);
     setText(status, '');
     if (explanation) { return; }
 
@@ -2697,20 +3375,24 @@
     }
     var task = currentHeatmapTask(cutoff);
     if (!task) {
-      setText(status, 'No heatmap has been generated for this cutoff. Generation reuses this job\'s saved ' +
-        'POV data and original checkpoint; it is not a new replay analysis.');
+      setText(status, 'No exact heatmap exists at ' + cutoffLabel + '. ' +
+        (isSavedPoint
+          ? 'This is a saved prediction time; generation must reproduce its saved probability.'
+          : 'This is a custom browsing time: its probability will come from the new inference, ' +
+            'and no curve point will be added.') +
+        ' Generation reuses this job\'s saved POV data and original checkpoint.');
       return;
     }
     if (task.state === 'queued' || task.state === 'running') {
       show(generate, false);
-      setText(status, 'Generating heatmap\u2026 this runs Grad-CAM for the selected POV and cutoff. ' +
-        'No percentage is available.');
+      setText(status, 'Heatmap at ' + cutoffLabel + '\u2026 state: ' + task.state + '. ' +
+        'The report stays available while this runs; no percentage is available.');
       return;
     }
     if (task.state === 'failed') {
       show(generate, false);
       show(retry, true);
-      setText(status, 'Heatmap generation failed. The report and original heatmap are unchanged.');
+      setText(status, 'Heatmap generation failed. The report and other heatmaps are unchanged.');
       show(error, true);
       setText(error, task.error || 'The heatmap could not be generated.');
     }
@@ -2729,14 +3411,14 @@
 
   function generateHeatmap() {
     if (!isBackendReport()) {
-      renderHeatmapOnDemand(currentCutoff());
+      renderHeatmapOnDemand(currentHeatmapCutoff());
       return;
     }
-    var cutoff = currentCutoff();
-    var pointIndex = findPointIndex(pointsOf(state.data), cutoff);
-    if (pointIndex < 0) {
+    var cutoff = currentHeatmapCutoff();
+    if (!Number.isFinite(cutoff)) {
       show($('heatmap-generate-error'), true);
-      setText($('heatmap-generate-error'), 'Select a saved prediction point before generating a heatmap.');
+      setText($('heatmap-generate-error'),
+        'Select a prediction point or a saved minimap time before generating a heatmap.');
       return;
     }
     cancelHeatmapTask();
@@ -2880,6 +3562,8 @@
         if (!data || typeof data !== 'object' || Array.isArray(data)) {
           throw new Error('review.json did not contain a JSON object.');
         }
+        var activeCutoff = currentHeatmapCutoff();
+        var stillCurrent = Math.abs(activeCutoff - task.cutoff) <= EPSILON;
         state.heatmapTask = null;
         state.data = data;
         state.info = probabilityInfo(data);
@@ -2889,22 +3573,11 @@
         renderChart(points, data);
         renderIntervals(points, data);
         renderStaticNotes(data);
-        var pointIndex = findPointIndex(points, task.cutoff);
-        if (pointIndex >= 0) {
-          state.selected = pointIndex;
-          state.selectedInterval = -1;
-          intervalsOf(data).forEach(function (interval, intervalIndex) {
-            if (Math.abs(num(interval.max_step_cutoff_seconds) - task.cutoff) < EPSILON ||
-                Math.abs(num(interval.peak_cutoff_seconds) - task.cutoff) < EPSILON) {
-              state.selectedInterval = intervalIndex;
-            }
-          });
-          syncIntervalButtons();
-          updateChartSelection();
-          renderDetail();
-        } else {
-          renderDetail();
-        }
+        if (stillCurrent) { state.heatmapCutoff = task.cutoff; }
+        syncIntervalButtons();
+        syncMomentNav();
+        updateChartSelection();
+        renderDetail();
         var pov = state.job.index ? findPov(state.job.index, task.player) : null;
         if (pov) { updatePovNote(data, pov); }
       })
@@ -2940,7 +3613,7 @@
   function renderMasking() {
     var body = $('masking-body');
     svgClear(body);
-    var explanation = findExplanation(state.data, currentCutoff());
+    var explanation = findExplanation(state.data, currentHeatmapCutoff());
     if (!explanation) {
       renderMaskingUnavailable('no explanation was exported for this cutoff');
       return;

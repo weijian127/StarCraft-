@@ -732,7 +732,7 @@ body.modal-open { overflow: hidden; }
 }
 #app > .card { margin: 0; }
 #chart-section { grid-area: chart; }
-#moments-panel { grid-area: moments; }
+#moments-panel { grid-area: moments; align-self: stretch; min-height: 0; }
 #preview-panel { grid-area: preview; }
 #app > section:last-of-type { grid-area: tech; }
 #app > .limitations-note { grid-column: 1 / -1; margin-top: 0; }
@@ -851,7 +851,7 @@ body.modal-open { overflow: hidden; }
 .preview-stage .heatmap { margin: 0; }
 
 /* suggested moments */
-.moments-panel { min-width: 0; }
+.moments-panel { min-width: 0; display: flex; flex-direction: column; min-height: 0; }
 .moments-head {
   display: flex;
   flex-wrap: wrap;
@@ -881,6 +881,62 @@ body.modal-open { overflow: hidden; }
 .moment-more p { margin: 4px 0 0; }
 .interval-button.is-selected { outline: 2px solid var(--band); outline-offset: 1px; }
 
+/* scrollable list of every saved prediction time */
+.prediction-times {
+  margin-top: 14px;
+  flex: 1 1 0;
+  min-height: 200px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.prediction-times-title {
+  margin: 0 0 6px;
+  font-size: 0.95rem;
+  color: var(--ink);
+}
+.prediction-times-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcfe;
+}
+.prediction-times-scroll:focus-visible { outline: 2px solid var(--accent-dark); outline-offset: 2px; }
+.prediction-times-list {
+  list-style: none;
+  margin: 0;
+  padding: 4px;
+  display: grid;
+  gap: 2px;
+}
+.prediction-time-row {
+  width: 100%;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  font-size: 0.82rem;
+  text-align: left;
+  cursor: pointer;
+}
+.prediction-time-row:hover { background: #f2f6fb; }
+.prediction-time-row:focus-visible { outline: 2px solid var(--accent-dark); outline-offset: -2px; }
+.prediction-time-row.is-selected {
+  background: #eef7f9;
+  border-color: rgba(40, 124, 142, 0.35);
+}
+.prediction-time-time { font-weight: 600; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.prediction-time-prob { color: var(--accent-dark); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.prediction-times-empty { padding: 10px; font-size: 0.82rem; color: var(--muted); }
+
 /* minimap legend swatches (also used by print rules below) */
 .swatch-self { background: #2878ff; }
 .swatch-neutral { background: #969696; }
@@ -888,6 +944,43 @@ body.modal-open { overflow: hidden; }
 .swatch-hidden { background: #000000; }
 .swatch-seen { background: #3f3f3f; }
 .swatch-visible { background: #c8c8c8; }
+
+/* ---------- replay minimap time scrubber ---------- */
+.frame-scrub {
+  width: min(100%, 420px);
+  margin: 14px auto 0;
+  display: grid;
+  gap: 6px;
+}
+.frame-scrub-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+.frame-scrub-row input[type="range"] {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  height: 22px;
+  accent-color: var(--accent-dark);
+  cursor: pointer;
+}
+.frame-scrub-row input[type="range"]:focus-visible { outline: 2px solid var(--accent-dark); outline-offset: 2px; }
+.frame-scrub-start, .frame-scrub-end { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.frame-scrub-readout {
+  margin: 0;
+  display: grid;
+  gap: 2px;
+  font-size: 0.86rem;
+}
+.frame-scrub-current { font-weight: 700; }
+.frame-scrub-current span, .frame-scrub-displayed span { font-variant-numeric: tabular-nums; }
+.frame-scrub-prob { color: var(--accent-dark); }
+.frame-scrub-note { margin: 0; font-size: 0.8rem; color: var(--muted); }
+.frame-scrub[hidden] { display: none; }
+
 
 
 @page { size: A4; margin: 12mm; }
@@ -900,7 +993,8 @@ body.modal-open { overflow: hidden; }
   #app { display: block; }
   #app > .card { margin: 6mm 0; }
   .pov-buttons, .ws-home, #pov-note, #ws-meta, #report-error,
-  .preview-tabs, .moment-nav, #intervals-toggle, .on-demand,
+  .preview-tabs, .moment-nav, #intervals-toggle, .on-demand, .frame-scrub,
+  .prediction-times,
   .context-section .actions, #game-view-block .actions { display: none !important; }
   .ws-toolbar { margin: 0 0 4mm; padding: 8px 10px; border-left: 3px solid #55637a; }
   .ws-title { font-size: 14pt; }

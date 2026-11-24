@@ -132,6 +132,78 @@ directory.
 the chosen explanation with relative URLs). `409 not_ready` while the job is not completed,
 `404` for an unknown id.
 
+### `GET /api/jobs/<job_id>/frames?player=<player>`
+
+Every saved observation of a completed POV, for the replay-minimap time slider:
+
+```json
+{"job_id": "...", "player": "player1", "frame_count": 3754,
+ "first_seconds": 0.044642857, "last_seconds": 1340.401785,
+ "source": "TimeInfo.npz",
+ "frame_seconds": [0.044642857, 0.401785714, ...]}
+```
+
+`frame_seconds` is the saved `faster_seconds` array from `TimeInfo.npz`, so the slider is not
+limited to prediction points or explanations. The same POV's `SpatialFeatures.npz` is
+decompressed once into a one-entry memory cache of combined uint8 visibility/ownership
+codes (one byte per 128×128 cell per frame). That cache is bounded to one POV and at most
+12000 observations (`409 recording_too_long` above that); no per-frame files or expanded
+disk caches are written. The player must be one of the job's POVs (`404 unknown_pov`) and
+the job must be completed (`409 not_ready`).
+
+### `GET /api/jobs/<job_id>/preview?player=<player>&frame=<index>`
+
+Minimap for one saved observation, rendered from the same bounded cache with the shared
+ownership/visibility palette:
+
+```json
+{"job_id": "...", "player": "player1", "frame_index": 1092,
+ "frame_seconds": 390.044642857, "game_loop": 8737, "frame_count": 3754,
+ "source": "saved_observation",
+ "image_url": "/api/jobs/<job_id>/preview/frame-player1-1092.png"}
+```
+
+`frame_seconds` and `game_loop` come from TimeInfo; nothing is interpolated and a
+motionless frame is returned as saved. `400 invalid_frame` for a non-integer,
+`422 frame_out_of_range` outside the recording. Requests are cheap (one view renders in a
+few milliseconds) so the browser can throttle a drag without expanding the archive again.
+
+### `GET /api/jobs/<job_id>/preview?player=<player>&cutoff=<seconds>`
+
+Reference minimap for any **saved** prediction cutoff of a completed job. It rebuilds the
+cutoff's sampled frames from the job's own saved arrays with the same deterministic sampler
+and settings recorded in the report, renders the last actually sampled frame with the shared
+ownership/visibility palette, and returns metadata plus an image URL:
+
+```json
+{"cutoff_seconds": 600.0, "frame_seconds": 599.6875, "game_loop": 13433,
+ "frame_index": 1679, "source": "reconstructed_from_saved_observations",
+ "sampling": {"frames": 50, "seed": 2026, "count": 1680,
+              "min_seconds": 35.75, "max_seconds": 599.6875},
+ "image_url": "/api/jobs/<job_id>/preview/prev-player1-600s-<key>.png"}
+```
+
+The first request for a POV prepares every cutoff in one feature-archive read and caches the
+PNGs plus a metadata file under `run/previews/<player>/`; later requests only read that
+cache. The cutoff must match a saved point (`422 unknown_cutoff`), the player must be one of
+the job's POVs (`404 unknown_pov`), and the job must be completed (`409 not_ready`).
+
+No model, Grad-CAM, SC2 or replay extraction runs for a preview, and no explanation entry is
+created. Demo/static exports have no job directory, so the UI keeps its "not recorded"
+empty state there.
+
+### `GET /api/jobs/<job_id>/preview/<preview>.png`
+
+Serves a preview minimap. Two controlled names are accepted:
+
+- `frame-<player>-<index>.png` is rendered on demand from the bounded observation cache.
+  The player must belong to the job and the index must be inside TimeInfo; no file path is
+  read and anything else is `404`.
+- `prev-<player>-<cutoff>s-<key>.png` must belong to that job's metadata cache and stay
+  inside the job's `run/previews/<player>/` directory; anything else is `404`.
+
+The public report whitelist (`review.json`, Grad-CAM/minimap/RGB PNGs) is unchanged.
+
 ### `POST /api/jobs/<job_id>/heatmaps`
 
 JSON body with exactly the controlled fields below; never a path or command:
@@ -140,26 +212,52 @@ JSON body with exactly the controlled fields below; never a path or command:
 {"player": "player1", "cutoff_seconds": 660.0}
 ```
 
-- `202` starts one queued heatmap and returns `status_url`. A completed cache hit returns
-  `200` with `"cached": true`; the same in-flight request returns its current status.
-  Another active heavy task (analysis or a different heatmap) returns `409 busy`.
-- The cutoff must already be one of the report's saved prediction points
-  (`422 unknown_cutoff`). The target class is derived from that point's saved probability.
+- `202` queues a heatmap and returns `status_url`. A completed cache hit returns `200` with
+  `"cached": true`; the same in-flight request returns its current status. Explicit requests
+  are queued ahead of remaining background preparation work; the explanation already
+  running is allowed to finish.
+- `cutoff_seconds` may be a saved prediction point or a custom browsing time. A saved point
+  keeps the saved-probability consistency checks. A custom time must contain enough saved
+  history (at least `frames` observations) and precede the terminal observation
+  (`422 insufficient_history` / `422 after_last_observation`); its target class is selected
+  by one forward pass at the exact cutoff (class 1 when the inferred probability is at least
+  0.5), and the displayed probability is that inference's own output. No saved curve point
+  or probability is added or modified.
 - Generation reuses `run/processed/both/<sample_id>`, the checkpoint recorded by the report,
-  and the report's POV/frames/seed/label definition. With `draws=1` the generated
-  probability must equal the saved timeline probability; a mismatch is reported and the
-  timeline/report probabilities are not modified.
+  and the report's POV/frames/seed/label definition. For saved points with `draws=1` the
+  generated probability must equal the saved timeline probability; a mismatch is reported
+  and the timeline/report probabilities are not modified.
 - The job state stays `completed`; the heatmap has its own `queued|running|completed|failed`
-  status. Repeated identical requests reuse the cache (job, POV, cutoff, target, checkpoint
-  SHA-256, frames, seed, draws, device, label definition).
+  status. Failed background jobs are recorded separately and do not invalidate the report.
+  Repeated identical requests reuse the cache after a restart. Cache identity includes the
+  job, POV, exact cutoff, target, checkpoint SHA-256, frames, seed, draws, device and label
+  definition; cutoffs are not rounded to whole minutes.
 - New images get unique names such as
   `gradcam_player1_660s_d58445ec07.png`; the original `gradcam_1.png` is never overwritten.
+
+### `POST /api/jobs/<job_id>/explanations/prepare`
+
+JSON body with exactly `{"player": "player1"}`. Queues up to **three** background
+explanations for the POV's candidate intervals: the existing Suggested-moments ranking by
+absolute net change, using each interval's saved maximum-change cutoff, deduplicated, with
+cached cutoffs skipped. With no intervals it preserves the existing single-explanation
+fallback (reuse an existing explanation, otherwise the later side of the largest adjacent
+change). Preparation is idempotent and only targets the requested job/POV; the job state
+stays `completed`. The response lists each candidate with `state`
+(`cached|queued|running|failed|unsupported|not_prepared`) and `pending`/`completed`/`failed`
+counts.
+
+### `GET /api/jobs/<job_id>/explanations/prepare?player=<player>`
+
+Read-only preparation status; it never starts a generation. Returns the same candidate list
+and counts, used by the browser to refresh the report when background explanations finish.
 
 ### `GET /api/jobs/<job_id>/heatmaps/<heatmap_id>`
 
 Returns the heatmap task state, target meaning, generated and timeline probabilities,
-probability-match result, native temporal-bin count, error fields and, when complete,
-`image_url`. No percentage is reported.
+`probability_source` (`saved_timeline|inference`), `custom_cutoff`, `requested_by`
+(`explicit|background`), probability-match result, native temporal-bin count, error fields
+and, when complete, `image_url`. No percentage is reported.
 
 ### `POST /api/jobs/<job_id>/game-view`
 
@@ -221,8 +319,12 @@ During a run, upload again to see `409 busy`; only one SC2 process starts.
 | 409 | `checkpoint_changed` / `processed_data_missing` | the original report inputs are unavailable |
 | 409 | `context_time_missing` / `replay_missing` | a game view has no saved context loop or replay copy |
 | 400 | `invalid_player` / `invalid_cutoff` / `invalid_json` | heatmap or game-view request fields are not the controlled pair |
+| 400 | `invalid_frame` | replay-minimap frame is not an integer observation index |
 | 404 | `unknown_pov` / `heatmap_not_found` | unknown POV or heatmap id |
 | 422 | `unknown_cutoff` / `no_explanation` | cutoff is not a saved point or has no explanation |
+| 422 | `insufficient_history` / `after_last_observation` | custom Grad-CAM time lacks enough saved history or uses the terminal observation |
+| 422 | `frame_out_of_range` | observation index is outside the saved TimeInfo range |
+| 409 | `recording_too_long` / `preview_unavailable` | observation cache limit exceeded or saved minimap layers unreadable |
 | 500 | `game_view_failed` / `game_view_time_mismatch` | RGB rendering failed or reached a different game loop |
 | 411 | `length_required` | no `Content-Length` (chunked uploads unsupported) |
 | 413 | `upload_too_large` | body exceeds `--max-upload-mib` |

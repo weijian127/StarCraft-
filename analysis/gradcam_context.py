@@ -5,6 +5,7 @@ the original frame/seed/cutoff settings. No model is loaded and no timeline is
 recomputed.
 """
 
+import io
 from pathlib import Path
 
 import numpy as np
@@ -101,13 +102,10 @@ def sampling_metadata(sample_dir, cutoff, frames, seed, source):
     }
 
 
-def render_minimap_context(sample_dir, frame_index, output_path):
-    """Render ownership/visibility at one saved observation to a square PNG."""
-    sample_dir = Path(sample_dir)
-    output_path = Path(output_path)
-    with np.load(sample_dir / "SpatialFeatures.npz", allow_pickle=False) as archive:
-        player_relative = archive["player_relative"][int(frame_index)]
-        visibility = archive["visibility_map"][int(frame_index)]
+def render_minimap_frame(player_relative, visibility, output_path):
+    """Render one saved ownership/visibility observation with the shared palette."""
+    player_relative = np.asarray(player_relative)
+    visibility = np.asarray(visibility)
     if player_relative.shape != (128, 128) or visibility.shape != (128, 128):
         raise ValueError("Expected 128x128 minimap layers")
     image = np.zeros((128, 128, 3), dtype=np.uint8)
@@ -117,9 +115,101 @@ def render_minimap_context(sample_dir, frame_index, output_path):
     player_relative = np.clip(player_relative, 0, len(OWNERSHIP_COLORS) - 1).astype(np.int64)
     for index, color in enumerate(OWNERSHIP_COLORS[1:], start=1):
         image[player_relative == index] = color
+    output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(image, mode="RGB").resize((512, 512), Image.Resampling.NEAREST).save(output_path)
 
+
+def render_minimap_context(sample_dir, frame_index, output_path):
+    """Render ownership/visibility at one saved observation to a square PNG."""
+    sample_dir = Path(sample_dir)
+    with np.load(sample_dir / "SpatialFeatures.npz", allow_pickle=False) as archive:
+        player_relative = archive["player_relative"][int(frame_index)]
+        visibility = archive["visibility_map"][int(frame_index)]
+    render_minimap_frame(player_relative, visibility, output_path)
+
+
+def render_minimap_frames(sample_dir, frame_indices, output_paths):
+    """Render several saved observations while decompressing the NPZ only once.
+
+    Dragging needs a minimap for every saved cutoff, and those frames repeat. The
+    caller passes each unique frame once; this keeps pointer movement from
+    decompressing the whole feature archive per cutoff.
+    """
+    sample_dir = Path(sample_dir)
+    frame_indices = [int(value) for value in frame_indices]
+    output_paths = [Path(value) for value in output_paths]
+    if not frame_indices or len(frame_indices) != len(output_paths):
+        raise ValueError("frame_indices and output_paths must be non-empty and aligned")
+    with np.load(sample_dir / "SpatialFeatures.npz", allow_pickle=False) as archive:
+        if "player_relative" not in archive.files or "visibility_map" not in archive.files:
+            raise ValueError("SpatialFeatures.npz lacks the minimap layers")
+        player_relative = archive["player_relative"]
+        visibility = archive["visibility_map"]
+        if len(player_relative) != len(visibility):
+            raise ValueError("Minimap layers disagree on frame count")
+        for frame, output in zip(frame_indices, output_paths):
+            if frame < 0 or frame >= len(visibility):
+                raise ValueError(f"frame index {frame} is outside the saved recording")
+            render_minimap_frame(player_relative[frame], visibility[frame], output)
+
+
+
+def observation_times(sample_dir):
+    """Every saved TimeInfo timestamp for one POV (seconds and game loops)."""
+    return _load_times(sample_dir)
+
+
+def load_minimap_codes(sample_dir):
+    """One uint8 code per minimap cell for all saved observations.
+
+    code = visibility * 5 + ownership. Storing the two saved layers as one code
+    array keeps the in-memory browse cache bounded (one byte per cell) while
+    still rendering exactly the saved observation; no unit positions are
+    interpolated and no frames are synthesised.
+    """
+    sample_dir = Path(sample_dir)
+    with np.load(sample_dir / "SpatialFeatures.npz", allow_pickle=False) as archive:
+        if "player_relative" not in archive.files or "visibility_map" not in archive.files:
+            raise ValueError("SpatialFeatures.npz lacks the minimap layers")
+        player_relative = archive["player_relative"]
+        visibility = archive["visibility_map"]
+        if len(player_relative) != len(visibility):
+            raise ValueError("Minimap layers disagree on frame count")
+        codes = (np.clip(visibility, 0, len(VISIBILITY_COLORS) - 1).astype(np.uint8) *
+                 len(OWNERSHIP_COLORS) +
+                 np.clip(player_relative, 0, len(OWNERSHIP_COLORS) - 1).astype(np.uint8))
+    return codes
+
+
+def _minimap_lut():
+    """Ownership over visibility, matching render_minimap_frame()."""
+    lut = np.zeros((256, 3), dtype=np.uint8)
+    for visibility, color in enumerate(VISIBILITY_COLORS):
+        lut[visibility * len(OWNERSHIP_COLORS):(visibility + 1) * len(OWNERSHIP_COLORS)] = color
+    for ownership, color in enumerate(OWNERSHIP_COLORS[1:], start=1):
+        for visibility in range(len(VISIBILITY_COLORS)):
+            lut[visibility * len(OWNERSHIP_COLORS) + ownership] = color
+    return lut
+
+
+MINIMAP_LUT = _minimap_lut()
+
+
+def minimap_frame_png(codes, frame_index, size=512):
+    """PNG bytes for exactly one saved observation, using the shared palette."""
+    codes = np.asarray(codes)
+    if codes.ndim != 3 or codes.shape[1:] != (128, 128):
+        raise ValueError("Expected saved 128x128 minimap code frames")
+    frame = int(frame_index)
+    if frame < 0 or frame >= len(codes):
+        raise ValueError(f"frame index {frame} is outside the saved recording")
+    image = MINIMAP_LUT[np.clip(codes[frame], 0, 255)]
+    buffer = io.BytesIO()
+    Image.fromarray(image, mode="RGB").resize(
+        (int(size), int(size)), Image.Resampling.NEAREST).save(
+            buffer, format="PNG", optimize=True)
+    return buffer.getvalue()
 
 
 def attribution_summary(data_npz):

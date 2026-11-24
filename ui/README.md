@@ -38,9 +38,9 @@ Leaving or switching the job aborts the pending request and clears the retry tim
 The report fetches `GET /api/jobs/<job_id>/report` for the POV list and then loads each
 POV's sanitised `review.json`. The report is a review workspace rather than a long page:
 
-- a compact toolbar with the match title (the report index's `map_title`, otherwise the
-  replay id), the POV buttons, the selected player's actual result and a link back to the
-  upload entry; the full match id lives in the collapsed **Match details** panel;
+- a toolbar with the match title (the report index's `map_title`, otherwise the replay id),
+  the POV buttons, the selected player's actual result and a link back to the upload entry;
+  the full match id lives in the collapsed **Match details** panel;
 - a **Timeline** card with the probability curve, candidate bands, heatmap rings and the
   50% reference line;
 - a **Suggested moments** card whose **Previous/Next** buttons follow the actual selected
@@ -52,7 +52,90 @@ POV's sanitised `review.json`. The report is a review workspace rather than a lo
 The preview is driven by one selection. Changing the cutoff or the POV clears the previous
 image, updates the selection strip and reloads each tab's content for the new moment.
 Tabs only switch visibility; they never start a generation request. The Minimap tab is the
-default and shows an explicit empty state when the export has no context image.
+default and shows the replay-minimap browser described below.
+
+### Timeline selection
+
+Clicking a prediction dot or a candidate band, or using `Enter`/`Space` on a focused dot or
+band, calls the same `selectPoint()` / `selectInterval()` used by the Previous/Next moment
+buttons. The graph is **not** draggable: moving across it does not change the selection. The
+selected dot keeps its drop line and probability label; the strip above the preview carries
+the full selection text.
+
+### Background explanations and custom Grad-CAM times
+
+Opening a completed POV asks the backend to prepare at most **three** candidate
+explanations in the background. Candidates are the existing Suggested moments ranked by
+absolute net change; each uses its saved maximum-change cutoff, duplicates are removed and
+already cached explanations are skipped. Fewer candidates mean fewer jobs; when there are
+no intervals, the existing single-explanation fallback is preserved (an explanation that
+already exists is reused, otherwise the later side of the largest adjacent change is used).
+The report is rendered before preparation starts and the analysis job stays `completed`.
+
+Generation uses the same single queue and heavy-task slot as explicit requests, one job at
+a time, and releases the slot between explanations. Explicit button clicks are dequeued
+before remaining background work; the operation already running is allowed to finish.
+Repeated preparation calls are idempotent and reuse successful cache entries after a
+restart. A failed background job is recorded in its own status file and never invalidates
+the report; it can be retried by the button or by reopening the POV.
+
+The Grad-CAM pane has its own requested time, separate from the selected prediction and
+the displayed minimap frame:
+
+- clicking a prediction uses that prediction's saved cutoff (even when its sampled frame
+  is slightly earlier);
+- moving the minimap slider sets the requested Grad-CAM time to the **browsing time**;
+  merely moving it never starts inference or SC2;
+- when the Grad-CAM tab is opened, an exact cached explanation is shown, otherwise the
+  button reads **Generate heatmap at [time]** and generation starts only on click;
+- a custom time outside the curve uses the actual probability from that inference. No
+  nearby curve probability is copied and no curve point is added; its target class follows
+  the existing policy (class 1 when the inference probability is at least 0.5);
+- saved curve cutoffs keep the existing probability consistency checks (draws=1 equality,
+  or the saved draw range);
+- the heatmap is cleared when the requested time or POV changes. A late result may be
+  cached, but it cannot replace the currently requested time.
+
+Cache identity includes job, POV, exact cutoff, checkpoint SHA-256, frames, seed, draws,
+device, label definition and target class; cutoffs are not rounded to whole minutes.
+
+### Replay minimap time slider
+
+Below the Minimap image there is a native `<input type="range">` that browses the POV's
+saved observations, not prediction points:
+
+- the slider spans every observation in the job's `TimeInfo.npz` (for example 3754 frames
+  for a 22-minute replay, about 0.357 s apart), so it is much denser than the 23 prediction
+  points and does not require an explanation;
+- the image is rendered from that observation's saved `player_relative` and
+  `visibility_map` with the existing ownership/visibility palette; `frame_index`,
+  `frame_seconds` and `game_loop` come from TimeInfo. Nothing is interpolated and no frame
+  is synthesised, so identical adjacent frames are allowed;
+- the caption calls it a **Replay minimap** and says explicitly that it is not necessarily
+  a model input sample. **Technical details** keeps the prediction's own sampled frame in
+  *Prediction reference frame* and the browsed one in *Replay minimap frame*;
+- *Browsing* follows the slider immediately; *Showing* only changes after that exact image
+  has loaded, so the time label always describes the image on screen. While a new frame is
+  loading the previous image and its label stay visible;
+- the probability line uses the nearest saved prediction **at or before** the browse time
+  and names its prediction time. Before the first prediction it says there is no prediction
+  yet. It is never presented as a per-frame prediction;
+- clicking a prediction or candidate jumps the slider to the observation that prediction
+  used when the export names it, otherwise the server maps the cutoff to the last sampled
+  observation;
+- requests are throttled to one per 60 ms with a trailing request (leading + trailing), the
+  previous request is aborted, and a request token plus the current slider index check
+  before an image is displayed. A slow older response can therefore never replace the
+  current frame, and POV changes clear the old image and frame list;
+- the native slider supports mouse, touch and keyboard (`Left`/`Right`/`Home`/`End`); its
+  `aria-valuetext` names the observation time and index. Dragging never calls the heatmap or
+  game-view generators.
+
+The model-input context minimap (the explanation's sampled frame and the optional
+Grad-CAM peak outline) now lives in the **Grad-CAM** tab, so the peak outline is never
+drawn over a different, browsed frame. Missing Grad-CAM/RGB still shows the existing empty
+state with **Generate heatmap** / **Render game view**. Demo and legacy exports keep their
+old "not recorded" behaviour because they have no job preview API.
 
 The main view shows only the probability of the current object (`probability_key` /
 `probability_subject`); the complement is not displayed because it is not the other POV's
@@ -82,22 +165,27 @@ adjacent changes are inside the card's own **Details** disclosure. The card area
 single sentence: “Large changes in model predictions; not confirmed causes of the result.”
 The threshold, merge cap and “local display rule” note live in **Technical details**.
 
-For a backend job, selecting a saved point without a heatmap shows **Generate heatmap**.
-The browser posts only `player` and `cutoff_seconds`; the backend reuses the job's saved
-POV arrays and original checkpoint. The UI shows queued/running/completed/failed/busy
-states without a percentage. A completed result is written into `review.json` with a
-unique image name, so a refresh keeps it; repeated requests use the cache. Static
-exports and demos show a clear “only available from a local backend job” message and do
-not send an API request.
+For a backend job, the Grad-CAM pane shows **Generate heatmap at [time]** when the exact
+requested time has no cached explanation. The browser posts only `player` and
+`cutoff_seconds`; the backend reuses the job's saved POV arrays and original checkpoint.
+Saved prediction cutoffs keep their probability consistency checks; a custom browsing time
+returns the probability produced by that inference. The UI shows real
+queued/running/completed/failed states without a percentage. A completed result is written
+into `review.json` with a unique image name, so a refresh keeps it; repeated requests use
+the cache. Opening the POV also prepares up to three candidate explanations in the
+background (see above). Static exports and demos show a clear “only available from a local
+backend job” message and do not send an API request.
 
-When an explanation has saved sampling metadata, the **Minimap** tab shows the
-model-input reference: self/enemy/neutral ownership colors, visibility colors
+The **Replay minimap** slider (above) renders saved observations, not model samples. When an
+explanation has saved sampling metadata, the **Grad-CAM** tab also shows the model-input
+context minimap below the heatmap: self/enemy/neutral ownership colors, visibility colors
 (hidden/seen/visible) and the last actually sampled frame. The legend labels are
 `self`, `Neutral objects`, `enemy`, `hidden`, `seen`, `visible`. Neutral objects (including
 resources) keep their original ownership color; secondary non-neutral ownership cells are
 shown as self in the reference image. Raw unit categories and model inputs are unchanged.
-The selection strip above the tabs names the context image time when the export records
-`context_frame.frame_seconds`.
+The **Grad-CAM details and interpretation** panel names the context image time when the
+export records `context_frame.frame_seconds`; **Technical details** has separate
+*Prediction reference frame* and *Replay minimap frame* rows.
 
 The **Grad-CAM** tab shows the heatmap with a short sentence that names the real
 `target_meaning`; the full caption, the sampled history (`sampling.frames`, seconds and
@@ -285,9 +373,10 @@ Notes:
   the same 4×4 row/column order as the raw array and is only a coarse reference.
 - Minimap, Grad-CAM and RGB images open in a modal viewer. Wheel/buttons zoom, dragging
   pans, Reset restores the view, Esc closes and focus returns to the trigger.
-- Print CSS hides the tabs, moment navigation and on-demand actions, then prints the
-  already-exported panes in order (Minimap, Game view, Grad-CAM) without starting any
-  generation. Figures and the chart stay whole, while text may flow across pages so a
+- Print CSS hides the tabs, moment navigation, the time slider and on-demand actions, then
+  prints the visible panes in order (the currently browsed replay minimap, Game view,
+  Grad-CAM) without starting any generation. Figures and the chart stay whole, while text
+  may flow across pages so a
   small technical panel no longer forces its own page. Legend swatches use
   `print-color-adjust: exact` plus a dark border, so Self, Enemy, Neutral and the
   visibility swatches remain distinguishable even when the browser's optional

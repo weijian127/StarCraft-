@@ -20,6 +20,8 @@ Endpoints::
     POST /api/jobs                     (multipart/form-data, one file field)
     GET  /api/jobs/<job_id>
     GET  /api/jobs/<job_id>/report
+    GET  /api/jobs/<job_id>/preview?player=<player>&cutoff=<seconds>
+    GET  /api/jobs/<job_id>/preview/<preview>.png
     GET  /jobs/<job_id>/report/<player>/{review.json,gradcam_1.png}
     GET  /ui/<file>                    (existing report viewer, served read-only)
 """
@@ -37,12 +39,12 @@ import sys
 import threading
 import time
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import numpy as np
 
@@ -52,13 +54,15 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from analysis.run_replay import (  # noqa: E402
     Failure, clean_env, inspect_replay, resolve_checkpoint, resolve_team_dir)
-from analysis.gradcam_context import enrich_explanation  # noqa: E402
+from analysis.gradcam_context import (  # noqa: E402
+    enrich_explanation, load_minimap_codes, minimap_frame_png, observation_times,
+    render_minimap_frames, sampling_metadata)
 from config import SC2_PATH  # noqa: E402
 from data_processing import processor  # noqa: E402
 from server import multipart  # noqa: E402
 from server.store import (  # noqa: E402
-    JOB_ID_PATTERN, JobNotFound, JobStore, ActiveSlot, now, PUBLIC_IMAGE_PATTERN,
-    atomic_write_json)
+    JOB_ID_PATTERN, JobNotFound, JobStore, ActiveSlot, now, PLAYER_PATTERN,
+    PUBLIC_IMAGE_PATTERN, atomic_write_json)
 from tools import prepare_replay_dependencies as deps  # noqa: E402
 
 ENGINE_LABEL = SimpleNamespace(version=processor.REPLAY_VERSION,
@@ -77,8 +81,14 @@ PUBLIC_FILES_BY_NAME = {"review.json": "application/json; charset=utf-8",
 FOCUS_LABELS = "0 = focus player loses, 1 = focus player wins"
 TERRAN_LABELS = "0 = Protoss wins, 1 = Terran wins"
 HEATMAP_ID_PATTERN = re.compile(r"^cam-player\d+-\d+s-[0-9a-f]{10}$")
+PREVIEW_NAME_PATTERN = re.compile(r"^prev-player\d+-\d+s-[0-9a-f]{8}\.png$")
+PREVIEW_MEMORY_ENTRIES = 6
+FRAME_NAME_PATTERN = re.compile(r"^frame-(?P<player>player\d+)-(?P<index>\d{1,7})\.png$")
+FRAME_MEMORY_ENTRIES = 1           # only the POV being browsed is kept in memory
+FRAME_CACHE_MAX_FRAMES = 12000     # ~196 MB of uint8 codes; longer replays are refused
 HEATMAP_REQUEST_LIMIT = 4096
 HEATMAP_TIMEOUT_SECONDS = 1800
+TARGET_TIMEOUT_SECONDS = 900
 EPSILON = 1e-6
 
 
@@ -217,13 +227,18 @@ def support_payload(config):
         },
         "heatmaps": {
             "on_demand": True,
+            "custom_times": True,
+            "background_candidates_per_pov": 3,
+            "queueing": True,
             "povs": 2,
             "max_concurrent": 1,
             "states": ["queued", "running", "completed", "failed"],
             "progress_percent": None,
             "inputs": ["player", "cutoff_seconds"],
             "note": "Generated from the job's saved POV data and original checkpoint; "
-                    "the analysis job stays completed.",
+                    "the analysis job stays completed. Opening a POV prepares at most three "
+                    "candidate-interval explanations in the background; explicit requests "
+                    "are queued ahead of remaining background work.",
         },
         "jobs": {
             "max_concurrent": 1,
@@ -641,6 +656,11 @@ def heatmap_status_payload(job_id, status, cached=False):
         "timeline_probability": status.get("timeline_probability"),
         "probability_match": status.get("probability_match"),
         "probability_note": status.get("probability_note"),
+        "probability_source": status.get("probability_source"),
+        "custom_cutoff": bool(status.get("custom_cutoff")),
+        "requested_by": status.get("requested_by"),
+        "request_hash": status.get("request_hash"),
+        "cache_key": status.get("cache_key"),
         "native_temporal_bins": status.get("native_temporal_bins"),
         "cached": bool(cached or status.get("cached")),
         "created_at": status.get("created_at"),
@@ -658,7 +678,13 @@ def heatmap_status_payload(job_id, status, cached=False):
 
 
 class HeatmapManager:
-    """Generate one on-demand Grad-CAM at a time under the shared heavy-task slot."""
+    """One shared Grad-CAM queue for background preparation and explicit requests.
+
+    A single worker generates one explanation at a time under the shared heavy-task
+    slot. Explicit browser requests are dequeued before remaining background work,
+    and the slot is released between explanations. Both paths share the same cache,
+    status files and review.json update logic.
+    """
 
     def __init__(self, config, store, slot, log):
         self.config = config
@@ -666,14 +692,21 @@ class HeatmapManager:
         self.slot = slot
         self.log = log
         self._mutex = threading.Lock()
-        self._thread = None
+        self._condition = threading.Condition(self._mutex)
+        self._explicit = deque()
+        self._background = deque()
+        self._queued = set()
+        self._active_key = None
+        self._active_spec = None
         self._process = None
         self._tree = None
-        self._active_id = None
-        self._active_job = None
-        self._active_context = None
         self._stopping = False
+        self._prepared = {}
+        self._sha_cache = {}
+        self._time_cache = OrderedDict()
         self.recover()
+        self._worker = threading.Thread(target=self._work, name="heatmap-worker", daemon=True)
+        self._worker.start()
 
     def recover(self):
         """Mark tasks left queued/running by a previous process as interrupted."""
@@ -689,50 +722,73 @@ class HeatmapManager:
                 atomic_write_json(path, status)
                 self.log.warning("marked heatmap %s interrupted", path.parent.name)
 
-    def _context(self, job_id, player, cutoff):
+    # ---- context and cache identity ---------------------------------------
+
+    def _checkpoint_sha(self, path):
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        key = (str(path), stat.st_size, stat.st_mtime_ns)
+        with self._mutex:
+            cached = self._sha_cache.get(key)
+        if cached is not None:
+            return cached
+        value = deps.sha256_file(path)
+        with self._mutex:
+            self._sha_cache[key] = value
+        return value
+
+    def _times(self, sample_dir):
+        key = str(sample_dir)
+        with self._mutex:
+            cached = self._time_cache.get(key)
+            if cached is not None:
+                self._time_cache.move_to_end(key)
+                return cached
+        seconds, loops = observation_times(sample_dir)
+        value = ([float(item) for item in seconds], [int(item) for item in loops])
+        with self._mutex:
+            self._time_cache[key] = value
+            while len(self._time_cache) > 4:
+                self._time_cache.popitem(last=False)
+        return value
+
+    def _base(self, job_id, player):
         record = self.store.read(job_id)
         if record.get("state") != "completed":
             raise HeatmapRequestError(409, "not_ready",
                                       "The analysis job is not completed; its report is not available.")
         if not re.match(r"^player\d+$", str(player)):
             raise HeatmapRequestError(400, "invalid_player", "Choose one of the job's player POVs.")
-        cutoff = float(cutoff)
-        if not np.isfinite(cutoff):
-            raise HeatmapRequestError(400, "invalid_cutoff", "cutoff_seconds must be a finite number.")
-        run_dir = self.store.run_dir(job_id)
+        run_dir = self.store.run_dir(job_id).resolve()
         index_path = run_dir / "report_index.json"
         if not index_path.is_file():
             raise HeatmapRequestError(409, "report_missing", "The report index is missing.")
-        index = json.loads(index_path.read_text(encoding="utf-8"))
+        try:
+            index = json.loads(index_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise HeatmapRequestError(500, "report_invalid", "The report index could not be read.") from error
         pov = next((item for item in index.get("povs") or [] if item.get("player") == player), None)
         if pov is None:
             raise HeatmapRequestError(404, "unknown_pov", f"The report has no {player} POV.")
         params = index.get("params") or {}
-        review_path = run_dir / pov["review"]
-        review = json.loads(review_path.read_text(encoding="utf-8"))
-        points = review.get("points") or []
-        point = next((item for item in points
-                      if abs(float(item.get("cutoff_seconds")) - cutoff) <= EPSILON), None)
-        if point is None:
-            raise HeatmapRequestError(422, "unknown_cutoff",
-                                      "cutoff_seconds must be one of the report's saved prediction cutoffs.")
-        key = review.get("probability_key") or "terran_win_probability"
+        review_path = (run_dir / str(pov.get("review"))).resolve()
+        if run_dir not in review_path.parents or not review_path.is_file():
+            raise HeatmapRequestError(500, "report_invalid", "The report path is outside the job.")
         try:
-            timeline_probability = float(point[key])
-        except (KeyError, TypeError, ValueError):
-            raise HeatmapRequestError(500, "report_invalid", "The report point has no probability.")
-        target = 1 if timeline_probability >= 0.5 else 0
-        label_definition = review.get("label_definition")
-        target_meaning = heatmap_target_meaning(label_definition, target)
-        sample_dir = run_dir / "processed" / "both" / str(pov.get("sample_id"))
-        if not sample_dir.is_dir():
+            review = json.loads(review_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise HeatmapRequestError(500, "report_invalid", "The report could not be read.") from error
+        sample_dir = (run_dir / "processed" / "both" / str(pov.get("sample_id"))).resolve()
+        if run_dir not in sample_dir.parents or not sample_dir.is_dir():
             raise HeatmapRequestError(409, "processed_data_missing",
                                       "The job's saved POV observations are not available.")
         checkpoint = Path(params.get("checkpoint") or self.config.checkpoint)
         if not checkpoint.is_file():
             raise HeatmapRequestError(409, "checkpoint_missing", "The original checkpoint is not available.")
         checkpoint_sha = (index.get("checkpoint") or {}).get("sha256")
-        if not checkpoint_sha or deps.sha256_file(checkpoint) != checkpoint_sha:
+        if not checkpoint_sha or self._checkpoint_sha(checkpoint) != checkpoint_sha:
             raise HeatmapRequestError(409, "checkpoint_changed",
                                       "The checkpoint no longer matches the one recorded by this report.")
         team_dir = Path(params.get("team_dir") or self.config.team_dir)
@@ -744,94 +800,205 @@ class HeatmapManager:
         device = str(params.get("device") or "cpu")
         if frames < 2:
             raise HeatmapRequestError(500, "report_invalid", "The report has no valid frame count.")
-        identity = {
-            "algorithm": "viz.gradcam.block3.v1",
-            "pov": player, "cutoff_seconds": round(cutoff, 9), "target_class": target,
-            "checkpoint_sha256": checkpoint_sha, "frames": frames, "seed": seed,
-            "draws": draws, "device": device, "label_definition": label_definition,
-        }
-        cache_key = hashlib.sha256(
-            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:10]
-        heatmap_id = f"cam-{player}-{int(round(cutoff))}s-{cache_key}"
-        image_name = f"gradcam_{player}_{int(round(cutoff))}s_{cache_key}.png"
-        storage = run_dir / "heatmaps" / heatmap_id
         return {
             "job_id": job_id, "record": record, "run_dir": run_dir, "index": index,
             "pov": pov, "player": player, "review_path": review_path, "review": review,
-            "cutoff": cutoff, "point": point, "timeline_probability": timeline_probability,
-            "target": target, "target_meaning": target_meaning,
-            "label_definition": label_definition, "sample_dir": sample_dir,
-            "checkpoint": checkpoint, "checkpoint_sha": checkpoint_sha, "team_dir": team_dir,
+            "sample_dir": sample_dir, "checkpoint": checkpoint,
+            "checkpoint_sha": checkpoint_sha, "team_dir": team_dir,
             "frames": frames, "seed": seed, "draws": draws, "device": device,
-            "cache_key": cache_key, "heatmap_id": heatmap_id, "image_name": image_name,
-            "storage": storage, "status_path": storage / "status.json",
-            "viz_dir": storage / "viz", "log_path": self.store.job_dir(job_id) / "logs" / f"heatmap-{heatmap_id}.log",
+            "label_definition": review.get("label_definition"),
+            "probability_key": review.get("probability_key") or "terran_win_probability",
         }
 
+    def _request_spec(self, job_id, player, raw_cutoff):
+        """Validate a cutoff and build the request identity (target resolved later)."""
+        spec = self._base(job_id, player)
+        try:
+            cutoff = float(raw_cutoff)
+        except (TypeError, ValueError) as error:
+            raise HeatmapRequestError(400, "invalid_cutoff",
+                                      "cutoff_seconds must be a finite number.") from error
+        if not np.isfinite(cutoff) or cutoff <= 0:
+            raise HeatmapRequestError(400, "invalid_cutoff", "cutoff_seconds must be a finite number.")
+        review = spec["review"]
+        points = review.get("points") or []
+        point = next((item for item in points
+                      if abs(float(item.get("cutoff_seconds")) - cutoff) <= EPSILON), None)
+        timeline_probability = None
+        target = None
+        if point is not None:
+            try:
+                timeline_probability = float(point[spec["probability_key"]])
+            except (KeyError, TypeError, ValueError):
+                raise HeatmapRequestError(500, "report_invalid", "The report point has no probability.")
+            target = 1 if timeline_probability >= 0.5 else 0
+        else:
+            seconds, _loops = self._times(spec["sample_dir"])
+            if spec["frames"] >= len(seconds):
+                raise HeatmapRequestError(
+                    409, "insufficient_history",
+                    "The recording has fewer saved observations than the report's frame count.")
+            minimum = seconds[spec["frames"] - 1]
+            maximum = seconds[-2]
+            if cutoff < minimum - EPSILON:
+                raise HeatmapRequestError(
+                    422, "insufficient_history",
+                    "This time has fewer than %d saved observations of history; the earliest "
+                    "supported time is %.3f s." % (spec["frames"], minimum))
+            if cutoff > maximum + EPSILON:
+                raise HeatmapRequestError(
+                    422, "after_last_observation",
+                    "The terminal observation cannot be used for Grad-CAM; the latest "
+                    "supported time is %.3f s." % maximum)
+        identity = {
+            "job_id": job_id,
+            "algorithm": "viz.gradcam.block3.v1",
+            "pov": player,
+            "cutoff_seconds": repr(float(cutoff)),
+            "checkpoint_sha256": spec["checkpoint_sha"],
+            "frames": spec["frames"],
+            "seed": spec["seed"],
+            "draws": spec["draws"],
+            "device": spec["device"],
+            "label_definition": spec["label_definition"],
+        }
+        request_hash = hashlib.sha256(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:10]
+        heatmap_id = f"cam-{player}-{int(round(cutoff))}s-{request_hash}"
+        image_name = f"gradcam_{player}_{int(round(cutoff))}s_{request_hash}.png"
+        storage = spec["run_dir"] / "heatmaps" / heatmap_id
+        spec.update({
+            "cutoff": float(cutoff), "point": point,
+            "timeline_probability": timeline_probability,
+            "custom_cutoff": point is None,
+            "target": target,
+            "target_meaning": (heatmap_target_meaning(spec["label_definition"], target)
+                               if target is not None else None),
+            "request_hash": request_hash, "heatmap_id": heatmap_id,
+            "image_name": image_name, "storage": storage,
+            "status_path": storage / "status.json", "viz_dir": storage / "viz",
+            "log_path": self.store.job_dir(job_id) / "logs" / f"heatmap-{heatmap_id}.log",
+        })
+        return spec
 
-    def _read_status(self, context):
-        path = context["status_path"]
+    def _read_status(self, spec):
+        path = spec["status_path"]
         if not path.is_file():
             return None
         try:
             status = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return None
-        if status.get("heatmap_id") != context["heatmap_id"]:
+        if status.get("heatmap_id") != spec["heatmap_id"]:
             return None
         return status
 
-    def _write_status(self, context, status):
+    def _write_status(self, spec, status):
         status = dict(status)
         status["format_version"] = 1
-        status["heatmap_id"] = context["heatmap_id"]
-        status["job_id"] = context["job_id"]
-        status["pov"] = context["player"]
-        status["cutoff_seconds"] = context["cutoff"]
-        status["target_class"] = context["target"]
-        status["target_meaning"] = context["target_meaning"]
-        status["timeline_probability"] = context["timeline_probability"]
-        status["image_name"] = context["image_name"]
+        status["heatmap_id"] = spec["heatmap_id"]
+        status["job_id"] = spec["job_id"]
+        status["pov"] = spec["player"]
+        status["cutoff_seconds"] = spec["cutoff"]
+        status["target_class"] = spec.get("target")
+        status["target_meaning"] = spec.get("target_meaning")
+        status["timeline_probability"] = spec.get("timeline_probability")
+        status["image_name"] = spec["image_name"]
+        status["custom_cutoff"] = bool(spec["custom_cutoff"])
+        status["request_hash"] = spec["request_hash"]
+        status["requested_by"] = status.get("requested_by") or spec.get("source")
         status["updated_at"] = now()
-        atomic_write_json(context["status_path"], status)
+        atomic_write_json(spec["status_path"], status)
         return status
 
-    def _cached_payload(self, context):
-        explanation = explanation_for_cutoff(
-            context["review"], context["cutoff"], context["target"])
+    @staticmethod
+    def _explanation_probability(explanation):
+        generation = explanation.get("generation") if isinstance(explanation, dict) else None
+        probability = (generation or {}).get("probability")
+        if probability is not None:
+            try:
+                return float(probability)
+            except (TypeError, ValueError):
+                pass
+        classes = explanation.get("class_probabilities") if isinstance(explanation, dict) else None
+        if isinstance(classes, (list, tuple)) and len(classes) == 2:
+            try:
+                return float(classes[1])
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    @staticmethod
+    def _policy_target(probability):
+        if probability is None or not np.isfinite(probability):
+            return None
+        return 1 if float(probability) >= 0.5 else 0
+
+    def _cached_payload(self, spec, export=True):
+        """Return an exact-cutoff cached explanation for this request, if valid."""
+        review = json.loads(spec["review_path"].read_text(encoding="utf-8"))
+        if spec["point"] is not None:
+            explanation = explanation_for_cutoff(review, spec["cutoff"], spec["target"])
+            probability = self._explanation_probability(explanation) if explanation else None
+            if probability is None:
+                probability = spec["timeline_probability"]
+            timeline_probability = spec["timeline_probability"]
+            generation = (explanation or {}).get("generation") or {}
+            probability_match = generation.get(
+                "probability_match",
+                abs(float(probability) - timeline_probability) <= EPSILON)
+            probability_source = generation.get("probability_source", "saved_timeline")
+            probability_note = generation.get("probability_note")
+        else:
+            explanation = explanation_for_cutoff(review, spec["cutoff"])
+            probability = self._explanation_probability(explanation) if explanation else None
+            if explanation is not None and self._policy_target(probability) != int(
+                    explanation.get("target_class", -1)):
+                explanation = None
+            timeline_probability = None
+            probability_match = None
+            generation = (explanation or {}).get("generation") or {}
+            probability_source = generation.get("probability_source", "inference")
+            probability_note = generation.get(
+                "probability_note",
+                "Custom cutoff: the probability is this inference's output; no saved curve "
+                "probability was copied or interpolated.")
         if explanation is None:
             return None
         image_name = explanation.get("image")
-        private_image = context["review_path"].parent / image_name
+        if not isinstance(image_name, str) or Path(image_name).name != image_name:
+            return None
+        private_image = spec["review_path"].parent / image_name
         if not private_image.is_file():
             return None
-        public_image = self.store.public_dir(context["job_id"]) / context["player"] / image_name
-        if not public_image.is_file():
-            try:
-                self.store.export_public(context["job_id"])
-            except Exception as error:  # noqa: BLE001 - report remains intact
-                self.log.exception("could not export cached heatmap %s", context["heatmap_id"])
-                raise HeatmapRequestError(500, "report_export_failed",
-                                          f"The cached heatmap exists but could not be published: {error}")
-        generation = explanation.get("generation") or {}
-        probability = generation.get("probability")
-        if probability is None:
-            class_probabilities = explanation.get("class_probabilities") or []
-            probability = (float(class_probabilities[1])
-                           if len(class_probabilities) == 2 else context["timeline_probability"])
+        if export:
+            public_image = self.store.public_dir(spec["job_id"]) / spec["player"] / image_name
+            if not public_image.is_file():
+                try:
+                    self.store.export_public(spec["job_id"])
+                except Exception as error:  # noqa: BLE001 - report remains intact
+                    self.log.exception("could not export cached heatmap %s", spec["heatmap_id"])
+                    raise HeatmapRequestError(
+                        500, "report_export_failed",
+                        f"The cached heatmap exists but could not be published: {error}") from error
+        target = int(explanation.get("target_class", spec.get("target") or 0))
         status = {
             "state": "completed",
-            "heatmap_id": generation.get("heatmap_id") or context["heatmap_id"],
-            "pov": context["player"],
-            "cutoff_seconds": context["cutoff"],
-            "target_class": context["target"],
-            "target_meaning": explanation.get("target_meaning") or context["target_meaning"],
+            "heatmap_id": generation.get("heatmap_id") or spec["heatmap_id"],
+            "pov": spec["player"],
+            "cutoff_seconds": spec["cutoff"],
+            "target_class": target,
+            "target_meaning": explanation.get("target_meaning") or heatmap_target_meaning(
+                spec["label_definition"], target),
             "probability": probability,
-            "timeline_probability": context["timeline_probability"],
-            "probability_match": generation.get(
-                "probability_match",
-                abs(float(probability) - context["timeline_probability"]) <= EPSILON),
-            "probability_note": generation.get("probability_note"),
+            "timeline_probability": timeline_probability,
+            "probability_match": probability_match,
+            "probability_note": probability_note,
+            "probability_source": probability_source,
+            "custom_cutoff": bool(spec["custom_cutoff"]),
+            "requested_by": generation.get("requested_by") or spec.get("source"),
+            "request_hash": generation.get("request_hash") or spec["request_hash"],
+            "cache_key": generation.get("cache_key"),
             "native_temporal_bins": generation.get("native_temporal_bins"),
             "image_name": image_name,
             "cached": True,
@@ -841,123 +1008,391 @@ class HeatmapManager:
             "error_code": None,
             "error_message": None,
         }
-        return heatmap_status_payload(context["job_id"], status, cached=True)
+        return heatmap_status_payload(spec["job_id"], status, cached=True)
 
+    @staticmethod
+    def _key(spec):
+        return (spec["job_id"], spec["player"], repr(float(spec["cutoff"])))
 
-    def request(self, job_id, player, cutoff):
-        """Return a cached result or start one queued generation."""
-        context = self._context(job_id, player, cutoff)
-        cached = self._cached_payload(context)
+    def request(self, job_id, player, cutoff, source="explicit"):
+        """Return a cached explanation or queue one Grad-CAM generation."""
+        spec = self._request_spec(job_id, player, cutoff)
+        spec["source"] = source
+        cached = self._cached_payload(spec)
         if cached:
             return cached, 200
-        status = self._read_status(context)
-        with self._mutex:
-            if self._thread is not None and self._thread.is_alive():
-                if self._active_id == context["heatmap_id"] and self._active_job == job_id:
-                    current = self._read_status(context) or status
-                    return heatmap_status_payload(job_id, current or {"state": "running"}), 202
-                raise HeatmapRequestError(409, "busy",
-                                          "Another heavy task is running. Retry after it finishes.")
-            if not self.slot.try_acquire():
-                raise HeatmapRequestError(409, "busy",
-                                          "Another analysis or heatmap is running. Retry after it finishes.")
-            try:
-                cached = self._cached_payload(context)
-                if cached:
-                    self.slot.release()
-                    return cached, 200
-                status = self._write_status(context, {
-                    "state": "queued",
-                    "probability": None,
-                    "probability_match": None,
-                    "created_at": now(),
-                    "started_at": None,
-                    "finished_at": None,
-                    "updated_at": now(),
-                    "error_code": None,
-                    "error_message": None,
-                    "cached": False,
-                })
-                self._active_id = context["heatmap_id"]
-                self._active_job = job_id
-                self._active_context = context
-                self._stopping = False
-                self._thread = threading.Thread(
-                    target=self._run, args=(context,), name=f"heatmap-{context['heatmap_id']}",
-                    daemon=True)
-                self._thread.start()
-            except Exception:
-                self.slot.release()
-                self._active_id = None
-                self._active_job = None
-                raise
+        key = self._key(spec)
+        with self._condition:
+            if self._active_key == key:
+                status = self._read_status(spec) or {"state": "running"}
+                return heatmap_status_payload(job_id, status), 202
+            if key in self._queued:
+                status = self._read_status(spec) or {"state": "queued"}
+                return heatmap_status_payload(job_id, status), 202
+            if source == "explicit":
+                kept = deque()
+                for item in self._explicit:
+                    if item["job_id"] == job_id and item["player"] == player:
+                        self._queued.discard(self._key(item))
+                        try:
+                            self._write_status(item, {
+                                "state": "failed", "cached": False,
+                                "error_code": "superseded",
+                                "error_message": "A newer explicit heatmap request replaced this queued one.",
+                                "finished_at": now(),
+                            })
+                        except Exception:  # noqa: BLE001 - the new request still proceeds
+                            self.log.exception("could not mark heatmap %s superseded", item["heatmap_id"])
+                    else:
+                        kept.append(item)
+                self._explicit = kept
+                self._explicit.append(spec)
+            else:
+                self._background.append(spec)
+            self._queued.add(key)
+            status = self._write_status(spec, {
+                "state": "queued",
+                "requested_by": source,
+                "probability": None,
+                "probability_match": None,
+                "probability_note": None,
+                "created_at": now(),
+                "started_at": None,
+                "finished_at": None,
+                "error_code": None,
+                "error_message": None,
+                "cached": False,
+            })
+            self._condition.notify_all()
         return heatmap_status_payload(job_id, status), 202
 
-    def status(self, job_id, heatmap_id):
-        self.store.read(job_id)
-        if not HEATMAP_ID_PATTERN.match(str(heatmap_id)):
-            raise HeatmapRequestError(404, "heatmap_not_found", "Unknown heatmap id.")
-        path = self.store.run_dir(job_id) / "heatmaps" / heatmap_id / "status.json"
-        if not path.is_file():
-            match = re.match(r"^cam-(player\d+)-(\d+)s-[0-9a-f]{10}$", str(heatmap_id))
-            if match:
-                try:
-                    context = self._context(job_id, match.group(1), float(match.group(2)))
-                except HeatmapRequestError:
-                    context = None
-                if context is not None and context["heatmap_id"] == heatmap_id:
-                    cached = self._cached_payload(context)
-                    if cached:
-                        return cached
-            raise HeatmapRequestError(404, "heatmap_not_found", "Unknown heatmap id.")
-        status = json.loads(path.read_text(encoding="utf-8"))
-        if status.get("job_id") != job_id:
-            raise HeatmapRequestError(404, "heatmap_not_found", "Unknown heatmap id.")
-        if status.get("state") == "completed" and status.get("image_name"):
-            public = self.store.public_dir(job_id) / status["pov"] / status["image_name"]
-            if not public.is_file():
-                try:
-                    self.store.export_public(job_id)
-                except Exception:  # noqa: BLE001 - status remains readable
-                    self.log.exception("could not re-export heatmap %s", heatmap_id)
-        return heatmap_status_payload(job_id, status, cached=bool(status.get("cached")))
+    # ---- single worker -----------------------------------------------------
 
+    def _acquire_slot(self, spec):
+        while not self._stopping:
+            if self.slot.try_acquire():
+                return True
+            with self._condition:
+                if spec.get("source") == "background" and self._explicit:
+                    self._background.appendleft(spec)
+                    self._queued.add(self._key(spec))
+                    return False
+                self._condition.wait(0.5)
+        return False
 
-    def _run(self, context):
-        try:
-            self._execute(context)
-        except Exception as error:  # noqa: BLE001 - every failure is recorded for retry
-            code = getattr(error, "code", "heatmap_failed")
-            message = getattr(error, "message", str(error))
-            if self._stopping:
-                code = "interrupted"
-                message = "The backend stopped before this heatmap finished."
-            self.log.warning("heatmap %s failed (%s): %s", context["heatmap_id"], code, message)
+    def _work(self):
+        while True:
+            with self._condition:
+                while (not self._stopping and not self._explicit and not self._background):
+                    self._condition.wait()
+                if self._stopping:
+                    return
+                spec = self._explicit.popleft() if self._explicit else self._background.popleft()
+                self._queued.discard(self._key(spec))
+                self._active_key = self._key(spec)
+                self._active_spec = spec
+            acquired = False
             try:
-                self._write_status(context, {
-                    "state": "failed",
-                    "started_at": (self._read_status(context) or {}).get("started_at"),
-                    "finished_at": now(),
-                    "error_code": code,
-                    "error_message": str(message)[:800],
-                    "cached": False,
-                })
-            except Exception:  # noqa: BLE001 - keep the original failure
-                self.log.exception("could not record heatmap failure %s", context["heatmap_id"])
-        finally:
-            with self._mutex:
-                tree = self._tree
-                self._tree = None
-                self._process = None
-                self._active_id = None
-                self._active_job = None
-                self._active_context = None
-            if tree is not None:
-                tree.close()
-            self.slot.release()
+                acquired = self._acquire_slot(spec)
+                if not acquired:
+                    continue
+                try:
+                    self._execute(spec)
+                except Exception as error:  # noqa: BLE001 - every failure is recorded
+                    self._record_failure(spec, error)
+            finally:
+                if acquired:
+                    self.slot.release()
+                with self._condition:
+                    tree = self._tree
+                    self._tree = None
+                    self._process = None
+                    self._active_key = None
+                    self._active_spec = None
+                    self._condition.notify_all()
+                if tree is not None:
+                    tree.close()
 
-    def _update_review(self, context, explanation):
-        review_path = context["review_path"]
+    def _record_failure(self, spec, error):
+        code = getattr(error, "code", "heatmap_failed")
+        message = getattr(error, "message", str(error))
+        if self._stopping:
+            code = "interrupted"
+            message = "The backend stopped before this heatmap finished."
+        self.log.warning("heatmap %s failed (%s): %s", spec["heatmap_id"], code, message)
+        try:
+            self._write_status(spec, {
+                "state": "failed",
+                "started_at": (self._read_status(spec) or {}).get("started_at"),
+                "finished_at": now(),
+                "error_code": code,
+                "error_message": str(message)[:800],
+                "cached": False,
+            })
+        except Exception:  # noqa: BLE001 - keep the original failure
+            self.log.exception("could not record heatmap failure %s", spec["heatmap_id"])
+
+    # ---- subprocesses ------------------------------------------------------
+
+    def _run_process(self, spec, command, timeout, cwd):
+        spec["log_path"].parent.mkdir(parents=True, exist_ok=True)
+        with spec["log_path"].open("a", encoding="utf-8") as log_file:
+            log_file.write("$ " + subprocess.list2cmdline(command) + "\n")
+            log_file.flush()
+            process = subprocess.Popen(command, cwd=str(cwd), stdout=log_file,
+                                       stderr=subprocess.STDOUT, shell=False, env=clean_env())
+            tree = KillOnCloseJob(self.log)
+            with self._mutex:
+                self._process = process
+                self._tree = tree
+            tree.assign(process)
+            deadline = time.monotonic() + timeout
+            while process.poll() is None:
+                if time.monotonic() > deadline:
+                    kill_process_tree(process.pid, self.log)
+                    tree.close()
+                    with self._mutex:
+                        if self._tree is tree:
+                            self._tree = None
+                        self._process = None
+                    raise HeatmapRunError("heatmap_timeout",
+                                          f"Grad-CAM work exceeded {timeout} s.")
+                time.sleep(0.5)
+            code = process.returncode
+            tree.close()
+            with self._mutex:
+                if self._tree is tree:
+                    self._tree = None
+                self._process = None
+            return code
+
+    def _infer_target(self, spec):
+        """Run one forward pass to select the target class for a custom cutoff."""
+        output = spec["storage"] / "target.json"
+        try:
+            output.unlink()
+        except OSError:
+            pass
+        command = [
+            self.config.python, "-m", "analysis.explain_target", str(spec["sample_dir"]),
+            str(spec["checkpoint"]), "--device", spec["device"],
+            "--frames", str(spec["frames"]), "--seed", str(spec["seed"]),
+            "--cutoff", repr(float(spec["cutoff"])), "--output", str(output),
+        ]
+        code = self._run_process(spec, command, TARGET_TIMEOUT_SECONDS, PROJECT_ROOT)
+        if code != 0 or not output.is_file():
+            raise HeatmapRunError(
+                "target_inference_failed",
+                f"target selection exited {code}; see {spec['log_path'].name}")
+        try:
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            probability = float(payload["probability"])
+            target = int(payload["target_class"])
+            classes = [float(value) for value in payload["class_probabilities"]]
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            raise HeatmapRunError("target_inference_failed",
+                                  f"target selection wrote invalid metadata: {error}") from error
+        if (not np.isfinite(probability) or not 0.0 <= probability <= 1.0
+                or len(classes) != 2 or target not in (0, 1)
+                or target != (1 if probability >= 0.5 else 0)):
+            raise HeatmapRunError("target_inference_failed",
+                                  "target selection returned an inconsistent probability/target")
+        if int(payload.get("frames", -1)) != spec["frames"] or int(payload.get("seed", -1)) != spec["seed"]:
+            raise HeatmapRunError("sampling_mismatch",
+                                  "target selection used different sampling settings")
+        if abs(float(payload.get("cutoff_seconds", -1)) - spec["cutoff"]) > EPSILON:
+            raise HeatmapRunError("cutoff_mismatch",
+                                  "target selection used a different cutoff")
+        if payload.get("label_definition") != spec["label_definition"]:
+            raise HeatmapRunError("label_mismatch",
+                                  "target selection used a different label definition")
+        return {"probability": probability, "class_probabilities": classes,
+                "target_class": target}
+
+    # ---- one generation ----------------------------------------------------
+
+    def _execute(self, spec):
+        spec["storage"].mkdir(parents=True, exist_ok=True)
+        spec["viz_dir"].mkdir(parents=True, exist_ok=True)
+        spec["log_path"].parent.mkdir(parents=True, exist_ok=True)
+        if spec["custom_cutoff"]:
+            self._write_status(spec, {
+                "state": "running", "started_at": now(), "updated_at": now(),
+                "error_code": None, "error_message": None,
+                "probability": None, "probability_match": None, "probability_note": None,
+            })
+            inference = self._infer_target(spec)
+            spec["target"] = inference["target_class"]
+            spec["target_meaning"] = heatmap_target_meaning(
+                spec["label_definition"], spec["target"])
+            spec["inference_probability"] = inference["probability"]
+            spec["inference_classes"] = inference["class_probabilities"]
+        target = spec["target"]
+        identity = {
+            "job_id": spec["job_id"], "algorithm": "viz.gradcam.block3.v1",
+            "pov": spec["player"],
+            "cutoff_seconds": repr(float(spec["cutoff"])), "target_class": target,
+            "checkpoint_sha256": spec["checkpoint_sha"], "frames": spec["frames"],
+            "seed": spec["seed"], "draws": spec["draws"], "device": spec["device"],
+            "label_definition": spec["label_definition"],
+        }
+        cache_key = hashlib.sha256(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:10]
+        spec["cache_key"] = cache_key
+        status = self._read_status(spec) or {}
+        status.update(state="running", started_at=status.get("started_at") or now(),
+                      updated_at=now(), error_code=None, error_message=None,
+                      probability=None, probability_match=None, probability_note=None,
+                      probability_source=("saved_timeline" if spec["point"] is not None else "inference"),
+                      cache_key=cache_key, cached=False)
+        self._write_status(spec, status)
+        self.log.info("heatmap %s running (%s @ %ss, target %s, %s)",
+                      spec["heatmap_id"], spec["player"], spec["cutoff"], target,
+                      "background" if spec.get("source") == "background" else "explicit")
+        command = [
+            self.config.python, "-m", "viz.gradcam", str(spec["sample_dir"]),
+            str(spec["checkpoint"]), "--device", spec["device"],
+            "--frames", str(spec["frames"]), "--seed", str(spec["seed"]),
+            "--target", str(target), "--cutoff", repr(float(spec["cutoff"])),
+            "--output", str(spec["viz_dir"]),
+        ]
+        exit_code = self._run_process(spec, command, HEATMAP_TIMEOUT_SECONDS, spec["team_dir"])
+        if exit_code != 0:
+            raise HeatmapRunError("heatmap_failed",
+                                  f"viz.gradcam exited {exit_code}; see {spec['log_path'].name}")
+        for name in ("snapshot.png", "data.npz", "method.json"):
+            if not (spec["viz_dir"] / name).is_file():
+                raise HeatmapRunError("heatmap_incomplete", f"viz.gradcam did not write {name}")
+        method = json.loads((spec["viz_dir"] / "method.json").read_text(encoding="utf-8"))
+        if int(method.get("target_class", -1)) != target:
+            raise HeatmapRunError("target_mismatch",
+                                  f"Generated target {method.get('target_class')!r} != {target}")
+        if method.get("label_definition") != spec["label_definition"]:
+            raise HeatmapRunError("label_mismatch",
+                                  f"Generated label definition {method.get('label_definition')!r} "
+                                  f"!= {spec['label_definition']!r}")
+        if int(method.get("frames", -1)) != spec["frames"] or int(method.get("seed", -1)) != spec["seed"]:
+            raise HeatmapRunError("sampling_mismatch",
+                                  "Generated frames/seed do not match the report's sampling settings.")
+        checkpoint_recorded = method.get("checkpoint")
+        if checkpoint_recorded and Path(checkpoint_recorded).resolve() != spec["checkpoint"].resolve():
+            raise HeatmapRunError("checkpoint_mismatch",
+                                  "Generated heatmap used a different checkpoint.")
+        with np.load(spec["viz_dir"] / "data.npz", allow_pickle=False) as archive:
+            cutoffs = archive["cutoff_seconds"].astype(float)
+            probabilities = archive["probabilities"].astype(float)
+            native_bins = int(archive["raw_heatmap"].shape[1]) if "raw_heatmap" in archive.files else None
+        if len(cutoffs) != 1 or abs(float(cutoffs[0]) - spec["cutoff"]) > EPSILON:
+            raise HeatmapRunError("cutoff_mismatch",
+                                  f"Generated cutoff {cutoffs.tolist()} != {spec['cutoff']}")
+        if probabilities.shape != (1, 2):
+            raise HeatmapRunError("heatmap_incomplete", f"probabilities shape {probabilities.shape}")
+        explained = float(probabilities[0][1])
+        timeline_probability = spec["timeline_probability"]
+        if spec["point"] is not None:
+            if int(spec["draws"]) == 1:
+                if abs(explained - timeline_probability) > EPSILON:
+                    raise HeatmapRunError(
+                        "probability_mismatch",
+                        f"Generated P={explained:.9f} but the saved timeline has "
+                        f"{timeline_probability:.9f} at {spec['cutoff']} s. The report and "
+                        "timeline probability were not modified.")
+                probability_match = True
+                probability_note = "Generated probability equals the saved timeline probability (draws=1)."
+            else:
+                draws = [float(value) for value in spec["point"].get("probability_draws") or []]
+                probability_match = bool(draws and min(draws) - 1e-9 <= explained <= max(draws) + 1e-9)
+                if not probability_match:
+                    raise HeatmapRunError(
+                        "probability_mismatch",
+                        f"Generated P={explained:.9f} is outside the saved draw range {draws}.")
+                probability_note = "Generated probability lies inside the saved draw range."
+            probability_source = "saved_timeline"
+        else:
+            if abs(explained - spec["inference_probability"]) > 1e-5:
+                raise HeatmapRunError(
+                    "probability_mismatch",
+                    f"Custom-time Grad-CAM P={explained:.9f} differs from the target-selection "
+                    f"inference P={spec['inference_probability']:.9f}.")
+            if (explained >= 0.5) != (spec["target"] == 1):
+                raise HeatmapRunError(
+                    "target_policy_mismatch",
+                    "The custom-time inference crossed the target-policy boundary between passes.")
+            probability_match = None
+            probability_source = "inference"
+            probability_note = ("Custom cutoff: the probability is this inference's output; no saved "
+                                "curve probability was copied or interpolated.")
+
+        image_path = spec["review_path"].parent / spec["image_name"]
+        shutil.copyfile(spec["viz_dir"] / "snapshot.png", image_path)
+        explanation = {
+            "cutoff_seconds": spec["cutoff"],
+            "displayed_frame_seconds": None,
+            "target_class": spec["target"],
+            "target_meaning": spec["target_meaning"],
+            "layer": method.get("layer"),
+            "score": method.get("score"),
+            "image": spec["image_name"],
+            "arrays": None,
+            "class_probabilities": [float(value) for value in probabilities[0]],
+            "masking_check": {
+                "available": False,
+                "reason": "On-demand viz.gradcam export does not include a masking diagnostic",
+            },
+            "generated_on_demand": True,
+            "generation": {
+                "heatmap_id": spec["heatmap_id"],
+                "request_hash": spec["request_hash"],
+                "cache_key": cache_key,
+                "checkpoint_sha256": spec["checkpoint_sha"],
+                "frames": spec["frames"],
+                "seed": spec["seed"],
+                "draws": spec["draws"],
+                "device": spec["device"],
+                "label_definition": spec["label_definition"],
+                "probability": explained,
+                "timeline_probability": timeline_probability,
+                "probability_match": probability_match,
+                "probability_source": probability_source,
+                "probability_note": probability_note,
+                "custom_cutoff": bool(spec["custom_cutoff"]),
+                "requested_by": spec.get("source") or "explicit",
+                "target_policy": "class 1 if inference probability >= 0.5 else class 0",
+                "native_temporal_bins": native_bins,
+                "created_at": now(),
+                "finished_at": now(),
+            },
+        }
+        try:
+            explanation.update(enrich_explanation(
+                spec["sample_dir"], spec["review_path"].parent,
+                spec["cutoff"], spec["frames"], spec["seed"],
+                spec["viz_dir"] / "data.npz", spec["player"],
+                "recorded_at_export", f"_{cache_key}"))
+        except Exception as error:  # noqa: BLE001 - keep the heatmap with unknown context
+            self.log.warning("heatmap %s context unavailable: %s", spec["heatmap_id"], error)
+            explanation["sampling"] = None
+            explanation["context_error"] = f"{type(error).__name__}: {error}"
+        self._update_review(spec, explanation)
+        try:
+            self.store.export_public(spec["job_id"])
+        except Exception as error:  # noqa: BLE001 - retry can export the cached review
+            raise HeatmapRunError("report_export_failed",
+                                  f"Heatmap generated but the report could not be published: {error}") from error
+        status = self._read_status(spec) or {}
+        status.update(
+            state="completed", probability=explained,
+            probability_match=probability_match,
+            probability_source=probability_source,
+            probability_note=probability_note,
+            class_probabilities=[float(value) for value in probabilities[0]],
+            native_temporal_bins=native_bins,
+            finished_at=now(), error_code=None, error_message=None, cached=False)
+        self._write_status(spec, status)
+        self.log.info("heatmap %s completed P=%.6f", spec["heatmap_id"], explained)
+
+    def _update_review(self, spec, explanation):
+        review_path = spec["review_path"]
         review = json.loads(review_path.read_text(encoding="utf-8"))
         backup = review_path.with_name(review_path.stem + ".before-on-demand-heatmaps.json")
         if not backup.exists():
@@ -965,7 +1400,7 @@ class HeatmapManager:
         explanations = []
         for existing in review.get("explanations") or []:
             is_same_cutoff = abs(float(existing.get("cutoff_seconds", float("nan")))
-                                 - context["cutoff"]) <= EPSILON
+                                 - spec["cutoff"]) <= EPSILON
             if is_same_cutoff and existing.get("generated_on_demand"):
                 continue
             explanations.append(existing)
@@ -975,159 +1410,13 @@ class HeatmapManager:
         atomic_write_json(review_path, review)
         return review
 
-
-    def _execute(self, context):
-        context["storage"].mkdir(parents=True, exist_ok=True)
-        context["viz_dir"].mkdir(parents=True, exist_ok=True)
-        context["log_path"].parent.mkdir(parents=True, exist_ok=True)
-        status = self._read_status(context) or {}
-        status.update(state="running", started_at=now(), updated_at=now(),
-                      error_code=None, error_message=None)
-        self._write_status(context, status)
-        self.log.info("heatmap %s running (%s @ %ss, target %s)",
-                      context["heatmap_id"], context["player"], context["cutoff"], context["target"])
-        command = [
-            self.config.python, "-m", "viz.gradcam", str(context["sample_dir"]),
-            str(context["checkpoint"]), "--device", context["device"],
-            "--frames", str(context["frames"]), "--seed", str(context["seed"]),
-            "--target", str(context["target"]), "--cutoff", repr(float(context["cutoff"])),
-            "--output", str(context["viz_dir"]),
-        ]
-        with context["log_path"].open("w", encoding="utf-8") as log_file:
-            log_file.write("$ " + subprocess.list2cmdline(command) + "\n")
-            log_file.flush()
-            process = subprocess.Popen(command, cwd=str(context["team_dir"]), stdout=log_file,
-                                       stderr=subprocess.STDOUT, shell=False, env=clean_env())
-            with self._mutex:
-                self._process = process
-            self._tree = KillOnCloseJob(self.log)
-            self._tree.assign(process)
-            deadline = time.monotonic() + HEATMAP_TIMEOUT_SECONDS
-            while process.poll() is None:
-                if time.monotonic() > deadline:
-                    kill_process_tree(process.pid, self.log)
-                    raise HeatmapRunError("heatmap_timeout",
-                                          f"Heatmap generation exceeded {HEATMAP_TIMEOUT_SECONDS} s.")
-                time.sleep(0.5)
-            exit_code = process.returncode
-        if exit_code != 0:
-            raise HeatmapRunError("heatmap_failed",
-                                  f"viz.gradcam exited {exit_code}; see {context['log_path'].name}")
-        for name in ("snapshot.png", "data.npz", "method.json"):
-            if not (context["viz_dir"] / name).is_file():
-                raise HeatmapRunError("heatmap_incomplete", f"viz.gradcam did not write {name}")
-        method = json.loads((context["viz_dir"] / "method.json").read_text(encoding="utf-8"))
-        if int(method.get("target_class", -1)) != context["target"]:
-            raise HeatmapRunError("target_mismatch",
-                                  f"Generated target {method.get('target_class')!r} != {context['target']}")
-        if method.get("label_definition") != context["label_definition"]:
-            raise HeatmapRunError("label_mismatch",
-                                  f"Generated label definition {method.get('label_definition')!r} "
-                                  f"!= {context['label_definition']!r}")
-        if int(method.get("frames", -1)) != context["frames"] or int(method.get("seed", -1)) != context["seed"]:
-            raise HeatmapRunError("sampling_mismatch",
-                                  "Generated frames/seed do not match the report's sampling settings.")
-        checkpoint_recorded = method.get("checkpoint")
-        if checkpoint_recorded and Path(checkpoint_recorded).resolve() != context["checkpoint"].resolve():
-            raise HeatmapRunError("checkpoint_mismatch",
-                                  "Generated heatmap used a different checkpoint.")
-        with np.load(context["viz_dir"] / "data.npz", allow_pickle=False) as archive:
-            cutoffs = archive["cutoff_seconds"].astype(float)
-            probabilities = archive["probabilities"].astype(float)
-            native_bins = int(archive["raw_heatmap"].shape[1]) if "raw_heatmap" in archive.files else None
-        if len(cutoffs) != 1 or abs(float(cutoffs[0]) - context["cutoff"]) > EPSILON:
-            raise HeatmapRunError("cutoff_mismatch",
-                                  f"Generated cutoff {cutoffs.tolist()} != {context['cutoff']}")
-        if probabilities.shape != (1, 2):
-            raise HeatmapRunError("heatmap_incomplete", f"probabilities shape {probabilities.shape}")
-        explained = float(probabilities[0][1])
-        timeline_probability = context["timeline_probability"]
-        if int(context["draws"]) == 1:
-            if abs(explained - timeline_probability) > EPSILON:
-                raise HeatmapRunError(
-                    "probability_mismatch",
-                    f"Generated P={explained:.9f} but the saved timeline has "
-                    f"{timeline_probability:.9f} at {context['cutoff']} s. The report and "
-                    "timeline probability were not modified.")
-            probability_match = True
-            probability_note = "Generated probability equals the saved timeline probability (draws=1)."
-        else:
-            draws = [float(value) for value in context["point"].get("probability_draws") or []]
-            probability_match = bool(draws and min(draws) - 1e-9 <= explained <= max(draws) + 1e-9)
-            if not probability_match:
-                raise HeatmapRunError(
-                    "probability_mismatch",
-                    f"Generated P={explained:.9f} is outside the saved draw range {draws}.")
-            probability_note = "Generated probability lies inside the saved draw range."
-
-
-        image_path = context["review_path"].parent / context["image_name"]
-        shutil.copyfile(context["viz_dir"] / "snapshot.png", image_path)
-        explanation = {
-            "cutoff_seconds": context["cutoff"],
-            "displayed_frame_seconds": None,
-            "target_class": context["target"],
-            "target_meaning": context["target_meaning"],
-            "layer": method.get("layer"),
-            "score": method.get("score"),
-            "image": context["image_name"],
-            "arrays": None,
-            "class_probabilities": [float(value) for value in probabilities[0]],
-            "masking_check": {
-                "available": False,
-                "reason": "On-demand viz.gradcam export does not include a masking diagnostic",
-            },
-            "generated_on_demand": True,
-            "generation": {
-                "heatmap_id": context["heatmap_id"],
-                "cache_key": context["cache_key"],
-                "checkpoint_sha256": context["checkpoint_sha"],
-                "frames": context["frames"],
-                "seed": context["seed"],
-                "draws": context["draws"],
-                "device": context["device"],
-                "label_definition": context["label_definition"],
-                "probability": explained,
-                "timeline_probability": timeline_probability,
-                "probability_match": True,
-                "probability_note": probability_note,
-                "native_temporal_bins": native_bins,
-                "created_at": now(),
-                "finished_at": now(),
-            },
-        }
-        try:
-            explanation.update(enrich_explanation(
-                context["sample_dir"], context["review_path"].parent,
-                context["cutoff"], context["frames"], context["seed"],
-                context["viz_dir"] / "data.npz", context["player"],
-                "recorded_at_export", f"_{context['cache_key']}"))
-        except Exception as error:  # noqa: BLE001 - keep the heatmap with unknown context
-            self.log.warning("heatmap %s context unavailable: %s", context["heatmap_id"], error)
-            explanation["sampling"] = None
-            explanation["context_error"] = f"{type(error).__name__}: {error}"
-        self._update_review(context, explanation)
-        try:
-            self.store.export_public(context["job_id"])
-        except Exception as error:  # noqa: BLE001 - retry can export the cached review
-            raise HeatmapRunError("report_export_failed",
-                                  f"Heatmap generated but the report could not be published: {error}")
-        status = self._read_status(context) or {}
-        status.update(
-            state="completed", probability=explained,
-            probability_match=probability_match,
-            probability_note=probability_note,
-            native_temporal_bins=native_bins,
-            class_probabilities=[float(value) for value in probabilities[0]],
-            finished_at=now(), error_code=None, error_message=None, cached=False)
-        self._write_status(context, status)
-        self.log.info("heatmap %s completed P=%.6f", context["heatmap_id"], explained)
-
     def stop_all(self):
         self._stopping = True
-        with self._mutex:
+        with self._condition:
+            self._condition.notify_all()
             process = self._process
-            context = self._active_context
+            tree = self._tree
+            spec = self._active_spec
         if process is not None and process.poll() is None:
             self.log.info("terminating heatmap process pid=%s", process.pid)
             kill_process_tree(process.pid, self.log)
@@ -1136,20 +1425,181 @@ class HeatmapManager:
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
-        if self._thread is not None and self._thread.is_alive():
-            self._thread.join(timeout=10)
-        if context is not None:
+        if tree is not None:
+            tree.close()
+        if self._worker is not None and self._worker.is_alive():
+            self._worker.join(timeout=15)
+        if spec is not None:
+            current = self._read_status(spec)
+            if current is None or current.get("state") not in ("completed", "failed"):
+                try:
+                    self._write_status(spec, {
+                        "state": "failed",
+                        "finished_at": now(),
+                        "error_code": "interrupted",
+                        "error_message": "The backend stopped before this heatmap finished.",
+                        "cached": False,
+                    })
+                except Exception:  # noqa: BLE001 - best effort during shutdown
+                    self.log.exception("could not mark heatmap interrupted")
+
+    # ---- status and background preparation ---------------------------------
+
+    def status(self, job_id, heatmap_id):
+        self.store.read(job_id)
+        if not HEATMAP_ID_PATTERN.match(str(heatmap_id)):
+            raise HeatmapRequestError(404, "heatmap_not_found", "Unknown heatmap id.")
+        path = self.store.run_dir(job_id) / "heatmaps" / heatmap_id / "status.json"
+        if path.is_file():
+            status = json.loads(path.read_text(encoding="utf-8"))
+            if status.get("job_id") != job_id:
+                raise HeatmapRequestError(404, "heatmap_not_found", "Unknown heatmap id.")
+            if status.get("state") == "completed" and status.get("image_name"):
+                public = self.store.public_dir(job_id) / status["pov"] / status["image_name"]
+                if not public.is_file():
+                    try:
+                        self.store.export_public(job_id)
+                    except Exception:  # noqa: BLE001 - status remains readable
+                        self.log.exception("could not re-export heatmap %s", heatmap_id)
+            return heatmap_status_payload(job_id, status, cached=bool(status.get("cached")))
+        match = re.match(r"^cam-(player\d+)-(\d+)s-[0-9a-f]{10}$", str(heatmap_id))
+        if match:
             try:
-                self._write_status(context, {
-                    "state": "failed",
-                    "finished_at": now(),
-                    "error_code": "interrupted",
-                    "error_message": "The backend stopped before this heatmap finished.",
-                    "cached": False,
+                spec = self._request_spec(job_id, match.group(1), float(match.group(2)))
+                cached = self._cached_payload(spec)
+            except HeatmapRequestError:
+                cached = None
+            if cached:
+                return cached
+        raise HeatmapRequestError(404, "heatmap_not_found", "Unknown heatmap id.")
+
+    @staticmethod
+    def _candidate_cutoffs(review):
+        """Top three candidate intervals by absolute net change, deduplicated."""
+        intervals = review.get("pivotal_intervals") or []
+        ranked = sorted(intervals,
+                        key=lambda item: abs(float(item.get("net_change") or 0.0)),
+                        reverse=True)
+        candidates = []
+        seen = set()
+        for interval in ranked:
+            value = interval.get("max_step_cutoff_seconds")
+            if value is None:
+                value = interval.get("peak_cutoff_seconds")
+            try:
+                cutoff = float(value)
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(cutoff):
+                continue
+            key = repr(cutoff)
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append({
+                "cutoff_seconds": cutoff,
+                "start_seconds": interval.get("start_seconds"),
+                "end_seconds": interval.get("end_seconds"),
+                "net_change": interval.get("net_change"),
+            })
+            if len(candidates) >= 3:
+                break
+        if not candidates:
+            # Preserve the analysis's existing single-explanation fallback: explain the
+            # later side of the largest adjacent change, or the only point when one exists.
+            if review.get("explanations"):
+                return []
+            points = sorted(review.get("points") or [],
+                            key=lambda item: float(item.get("cutoff_seconds") or 0.0))
+            if points:
+                index = 0
+                if len(points) > 1:
+                    probability_key = (review.get("probability_key")
+                                       or "terran_win_probability")
+                    deltas = [
+                        abs(float(points[position + 1].get(probability_key) or 0.0)
+                            - float(points[position].get(probability_key) or 0.0))
+                        for position in range(len(points) - 1)
+                    ]
+                    index = max(range(len(deltas)), key=deltas.__getitem__) + 1
+                candidates.append({
+                    "cutoff_seconds": float(points[index]["cutoff_seconds"]),
+                    "start_seconds": None, "end_seconds": None, "net_change": None,
                 })
-            except Exception:  # noqa: BLE001 - best effort during shutdown
-                self.log.exception("could not mark heatmap interrupted")
-        self.slot.release()
+        return candidates
+
+    def _prepare_entries(self, job_id, player, candidates, enqueue):
+        entries = []
+        for candidate in candidates:
+            cutoff = candidate["cutoff_seconds"]
+            entry = {"cutoff_seconds": cutoff,
+                     "start_seconds": candidate.get("start_seconds"),
+                     "end_seconds": candidate.get("end_seconds"),
+                     "net_change": candidate.get("net_change")}
+            try:
+                spec = self._request_spec(job_id, player, cutoff)
+                entry.update({"heatmap_id": spec["heatmap_id"],
+                              "status_url": f"/api/jobs/{job_id}/heatmaps/{spec['heatmap_id']}"})
+                if enqueue:
+                    payload, _status = self.request(job_id, player, cutoff, source="background")
+                    if payload.get("cached") or payload.get("state") == "completed":
+                        entry["state"] = "cached"
+                    else:
+                        entry["state"] = payload.get("state") or "queued"
+                    entry["error_code"] = payload.get("error_code")
+                    entry["error_message"] = payload.get("error_message")
+                else:
+                    cached = self._cached_payload(spec, export=False)
+                    status = self._read_status(spec)
+                    if cached:
+                        entry["state"] = "cached"
+                    elif status is not None:
+                        entry["state"] = status.get("state")
+                        entry["error_code"] = status.get("error_code")
+                        entry["error_message"] = status.get("error_message")
+                    else:
+                        entry["state"] = "not_prepared"
+            except HeatmapRequestError as error:
+                entry.update({"state": "unsupported", "error_code": error.code,
+                              "error_message": error.message})
+            entries.append(entry)
+        return entries
+
+    @staticmethod
+    def _prepare_payload(job_id, player, entries, prepared):
+        pending = sum(1 for item in entries if item.get("state") in ("queued", "running"))
+        failed = sum(1 for item in entries if item.get("state") == "failed")
+        completed = sum(1 for item in entries if item.get("state") in ("cached", "completed"))
+        return {
+            "format_version": 1,
+            "job_id": job_id,
+            "player": player,
+            "analysis_state": "completed",
+            "prepared": bool(prepared),
+            "candidates": entries,
+            "pending": pending,
+            "failed": failed,
+            "completed": completed,
+        }
+
+    def prepare(self, job_id, player):
+        """Queue up to three candidate-interval explanations in the background."""
+        base = self._base(job_id, player)
+        candidates = self._candidate_cutoffs(base["review"])
+        entries = self._prepare_entries(job_id, player, candidates, enqueue=True)
+        self._prepared[(job_id, player)] = [dict(item) for item in candidates]
+        return self._prepare_payload(job_id, player, entries, prepared=True)
+
+    def prepare_status(self, job_id, player):
+        """Read-only preparation status; never starts a generation itself."""
+        base = self._base(job_id, player)
+        candidates = self._prepared.get((job_id, player))
+        if candidates is None:
+            candidates = self._candidate_cutoffs(base["review"])
+            entries = self._prepare_entries(job_id, player, candidates, enqueue=False)
+            return self._prepare_payload(job_id, player, entries, prepared=False)
+        entries = self._prepare_entries(job_id, player, candidates, enqueue=False)
+        return self._prepare_payload(job_id, player, entries, prepared=True)
 
 
 class GameViewManager:
@@ -1393,6 +1843,329 @@ def job_payload(record):
     return payload
 
 
+class PreviewError(Exception):
+    """Public request failure for a reference minimap preview."""
+
+    def __init__(self, status, code, message):
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.message = message
+
+
+class PreviewManager:
+    """Saved-observation minimaps for a completed POV.
+
+    Two read-only views share the job's saved arrays and the same palette:
+
+    * ``lookup``/``image`` rebuild the deterministic sampler result for a saved
+      prediction cutoff and cache those PNGs on disk.
+    * ``frames``/``lookup_frame``/``frame_image`` expose every saved observation
+      from TimeInfo (not only prediction points). One combined uint8 code array
+      per POV is kept in a one-entry memory cache, so dragging the time slider
+      renders a single saved frame without decompressing the NPZ again.
+
+    No model, Grad-CAM, SC2 or replay extraction runs here.
+    """
+
+    def __init__(self, store, log):
+        self.store = store
+        self.log = log
+        self._mutex = threading.Lock()      # guards the caches and lock table
+        self._key_locks = {}                # (job, player) -> Lock
+        self._memory = OrderedDict()        # (job, player) -> cutoff entries
+        self._frames = OrderedDict()        # (job, player) -> observation context
+        self._read_lock = threading.Lock()  # one NPZ decompression at a time
+
+    def _lock_for(self, key):
+        with self._mutex:
+            return self._key_locks.setdefault(key, threading.Lock())
+
+    def _remember(self, key, entries):
+        with self._mutex:
+            self._memory[key] = entries
+            self._memory.move_to_end(key)
+            while len(self._memory) > PREVIEW_MEMORY_ENTRIES:
+                self._memory.popitem(last=False)
+
+    def _remember_frames(self, key, context):
+        with self._mutex:
+            self._frames[key] = context
+            self._frames.move_to_end(key)
+            while len(self._frames) > FRAME_MEMORY_ENTRIES:
+                self._frames.popitem(last=False)
+
+    def _context(self, job_id, player):
+        record = self.store.read(job_id)
+        if record.get("state") != "completed":
+            raise PreviewError(409, "not_ready", f"Job is {record.get('state')!r}")
+        players = (record.get("report") or {}).get("players") or {}
+        if player not in players:
+            raise PreviewError(404, "unknown_pov", f"The report has no {player} POV.")
+        run_dir = self.store.run_dir(job_id).resolve()
+        index_path = run_dir / "report_index.json"
+        if not index_path.is_file():
+            raise PreviewError(409, "report_missing", "The report index is missing.")
+        try:
+            index = json.loads(index_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise PreviewError(500, "report_invalid", "The report index could not be read.") from error
+        pov = next((entry for entry in index.get("povs") or []
+                    if entry.get("player") == player), None)
+        if not pov:
+            raise PreviewError(404, "unknown_pov", f"The report has no {player} POV.")
+        review_path = (run_dir / str(pov.get("review"))).resolve()
+        if run_dir not in review_path.parents:
+            raise PreviewError(500, "report_invalid", "The report path is outside the job.")
+        try:
+            review = json.loads(review_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise PreviewError(500, "report_invalid", "The report could not be read.") from error
+        frames = review.get("frames")
+        seed = review.get("seed")
+        if not isinstance(frames, int) or frames < 1 or not isinstance(seed, int):
+            raise PreviewError(500, "report_invalid", "The report has no sampling settings.")
+        sample_id = review.get("sample_id") or pov.get("sample_id")
+        sample_dir = (run_dir / "processed" / "both" / str(sample_id or "")).resolve()
+        if run_dir not in sample_dir.parents or not (sample_dir / "SpatialFeatures.npz").is_file():
+            raise PreviewError(409, "processed_data_missing",
+                               "The saved POV arrays are not available for this report.")
+        points = []
+        for point in review.get("points") or []:
+            value = point.get("cutoff_seconds")
+            if isinstance(value, (int, float)) and value == value:
+                points.append(float(value))
+        if not points:
+            raise PreviewError(409, "report_missing", "The report has no prediction points.")
+        return run_dir, sample_dir, frames, seed, points
+
+
+    def _prepare(self, job_id, player):
+        run_dir, sample_dir, frames, seed, points = self._context(job_id, player)
+        output_dir = run_dir / "previews" / player
+        output_dir.mkdir(parents=True, exist_ok=True)
+        fingerprint = hashlib.sha256(
+            ("v2|%s|%d|%d|%s" % (sample_dir.name, frames, seed,
+                                 ",".join("%.3f" % value for value in points))).encode("utf-8")
+        ).hexdigest()[:8]
+        meta_path = output_dir / ("previews-%s.json" % fingerprint)
+        if meta_path.is_file():
+            try:
+                payload = json.loads(meta_path.read_text(encoding="utf-8"))
+                entries = payload.get("entries") or {}
+                if entries and all((output_dir / entry["image"]).is_file()
+                                   for entry in entries.values()):
+                    return entries
+            except (OSError, ValueError, KeyError):
+                self.log.warning("rebuilding unreadable preview cache %s", meta_path.name)
+
+        samplings = {}
+        for cutoff in points:
+            samplings[cutoff] = sampling_metadata(
+                sample_dir, cutoff, frames, seed, "reconstructed_from_saved_observations")
+        names = {}
+        for cutoff, sampling in samplings.items():
+            frame = int(sampling["last_frame_index"])
+            names.setdefault(frame, "prev-%s-%ds-%s.png"
+                             % (player, int(round(cutoff)), fingerprint))
+        with self._read_lock:
+            render_minimap_frames(sample_dir, list(names), [output_dir / name
+                                                           for name in names.values()])
+        entries = {}
+        for cutoff, sampling in samplings.items():
+            frame = int(sampling["last_frame_index"])
+            entries[repr(float(cutoff))] = {
+                "image": names[frame],
+                "frame_index": frame,
+                "frame_seconds": float(sampling["last_frame_seconds"]),
+                "game_loop": int(sampling["last_game_loop"]),
+                "frames": int(frames),
+                "seed": int(seed),
+                "count": int(sampling["count"]),
+                "min_seconds": float(sampling["min_seconds"]),
+                "max_seconds": float(sampling["max_seconds"]),
+                "source": sampling["source"],
+            }
+        atomic_write_json(meta_path, {
+            "job_id": job_id, "player": player, "frames": frames, "seed": seed,
+            "sample": sample_dir.name, "entries": entries,
+        })
+        return entries
+
+    def _entries(self, job_id, player):
+        key = (job_id, player)
+        with self._mutex:
+            cached = self._memory.get(key)
+        if cached is not None:
+            return cached
+        with self._lock_for(key):
+            with self._mutex:
+                cached = self._memory.get(key)
+            if cached is not None:
+                return cached
+            try:
+                entries = self._prepare(job_id, player)
+            except PreviewError:
+                raise
+            except (OSError, ValueError) as error:
+                self.log.exception("could not prepare previews for %s/%s", job_id, player)
+                raise PreviewError(409, "preview_unavailable",
+                                   f"Reference minimaps could not be rebuilt: {error}") from error
+            self._remember(key, entries)
+            return entries
+
+    def lookup(self, job_id, player, raw_cutoff):
+        """Metadata for one saved cutoff; the image is served by :meth:`image`."""
+        if not PLAYER_PATTERN.match(str(player or "")):
+            raise PreviewError(400, "invalid_player", "Choose one of the job's player POVs.")
+        try:
+            cutoff = float(raw_cutoff)
+        except (TypeError, ValueError) as error:
+            raise PreviewError(400, "invalid_cutoff",
+                               "cutoff must be one of the report's saved prediction times.") from error
+        if cutoff != cutoff or cutoff in (float("inf"), float("-inf")):
+            raise PreviewError(400, "invalid_cutoff", "cutoff must be a finite number.")
+        entries = self._entries(job_id, player)
+        entry = None
+        for key, candidate in entries.items():
+            if abs(float(key) - cutoff) <= EPSILON:
+                entry = candidate
+                break
+        if entry is None:
+            raise PreviewError(422, "unknown_cutoff",
+                               "cutoff must be one of the report's saved prediction times.")
+        return {
+            "cutoff_seconds": float(cutoff),
+            "frame_seconds": entry["frame_seconds"],
+            "game_loop": entry["game_loop"],
+            "frame_index": entry["frame_index"],
+            "source": entry["source"],
+            "sampling": {
+                "frames": entry["frames"], "seed": entry["seed"], "count": entry["count"],
+                "min_seconds": entry["min_seconds"], "max_seconds": entry["max_seconds"],
+            },
+            "image_url": "/api/jobs/%s/preview/%s" % (job_id, entry["image"]),
+        }
+
+    def image(self, job_id, name):
+        """Bytes of one cached preview image, restricted to this job's own cache."""
+        if not PREVIEW_NAME_PATTERN.match(str(name or "")):
+            raise PreviewError(404, "not_found", "Unknown preview image")
+        player = name.split("-")[1]
+        entries = self._entries(job_id, player)
+        if name not in {entry["image"] for entry in entries.values()}:
+            raise PreviewError(404, "not_found", "That preview is not part of this report")
+        run_dir = self.store.run_dir(job_id).resolve()
+        path = (run_dir / "previews" / player / name).resolve()
+        if run_dir not in path.parents or not path.is_file():
+            raise PreviewError(404, "not_found", "The preview image is not available")
+        return path.read_bytes()
+
+
+    # ---- continuous replay-minimap browsing --------------------------------
+
+    def _frame_context(self, job_id, player):
+        """TimeInfo timestamps plus one bounded code array for this POV."""
+        key = (job_id, player)
+        with self._mutex:
+            cached = self._frames.get(key)
+            if cached is not None:
+                self._frames.move_to_end(key)
+                return cached
+        with self._lock_for(key):
+            with self._mutex:
+                cached = self._frames.get(key)
+                if cached is not None:
+                    self._frames.move_to_end(key)
+                    return cached
+            _run_dir, sample_dir, _frames, _seed, _points = self._context(job_id, player)
+            try:
+                seconds, loops = observation_times(sample_dir)
+            except (OSError, ValueError) as error:
+                raise PreviewError(409, "preview_unavailable",
+                                   f"Saved observation times could not be read: {error}") from error
+            if len(seconds) > FRAME_CACHE_MAX_FRAMES:
+                raise PreviewError(
+                    409, "recording_too_long",
+                    f"This recording has {len(seconds)} saved observations; continuous "
+                    f"browsing is limited to {FRAME_CACHE_MAX_FRAMES}.")
+            with self._read_lock:
+                try:
+                    codes = load_minimap_codes(sample_dir)
+                except (OSError, ValueError) as error:
+                    raise PreviewError(
+                        409, "preview_unavailable",
+                        f"Saved minimap observations could not be read: {error}") from error
+            if len(codes) != len(seconds):
+                raise PreviewError(409, "preview_unavailable",
+                                   "Saved minimap frames and TimeInfo timestamps disagree.")
+            context = {
+                "seconds": [float(value) for value in seconds],
+                "loops": [int(value) for value in loops],
+                "codes": codes,
+            }
+            self._remember_frames(key, context)
+            return context
+
+    def frames(self, job_id, player):
+        """Every saved observation time of one POV (not just prediction points)."""
+        if not PLAYER_PATTERN.match(str(player or "")):
+            raise PreviewError(400, "invalid_player", "Choose one of the job's player POVs.")
+        context = self._frame_context(job_id, player)
+        seconds = context["seconds"]
+        return {
+            "job_id": job_id,
+            "player": player,
+            "frame_count": len(seconds),
+            "first_seconds": seconds[0],
+            "last_seconds": seconds[-1],
+            "source": "TimeInfo.npz",
+            "frame_seconds": [round(value, 6) for value in seconds],
+        }
+
+    def lookup_frame(self, job_id, player, raw_index):
+        """Metadata for one saved observation; the PNG is served by frame_image()."""
+        if not PLAYER_PATTERN.match(str(player or "")):
+            raise PreviewError(400, "invalid_player", "Choose one of the job's player POVs.")
+        try:
+            index = int(str(raw_index).strip())
+        except (TypeError, ValueError) as error:
+            raise PreviewError(400, "invalid_frame",
+                               "frame must be an integer observation index.") from error
+        context = self._frame_context(job_id, player)
+        if index < 0 or index >= len(context["seconds"]):
+            raise PreviewError(422, "frame_out_of_range",
+                               "frame must be a saved observation of this POV.")
+        return {
+            "job_id": job_id,
+            "player": player,
+            "frame_index": index,
+            "frame_seconds": context["seconds"][index],
+            "game_loop": context["loops"][index],
+            "frame_count": len(context["seconds"]),
+            "source": "saved_observation",
+            "image_url": "/api/jobs/%s/preview/frame-%s-%d.png" % (job_id, player, index),
+        }
+
+    def frame_image(self, job_id, name):
+        """PNG of one saved observation, rendered from the bounded code cache."""
+        match = FRAME_NAME_PATTERN.match(str(name or ""))
+        if not match:
+            raise PreviewError(404, "not_found", "Unknown replay minimap frame")
+        player = match.group("player")
+        index = int(match.group("index"))
+        if not PLAYER_PATTERN.match(player):
+            raise PreviewError(404, "not_found", "Unknown replay minimap frame")
+        context = self._frame_context(job_id, player)
+        if index >= len(context["seconds"]):
+            raise PreviewError(404, "not_found", "That observation is not in this recording")
+        try:
+            return minimap_frame_png(context["codes"], index)
+        except ValueError as error:
+            raise PreviewError(409, "preview_unavailable",
+                               f"That observation could not be rendered: {error}") from error
+
+
 class Handler(BaseHTTPRequestHandler):
     """Routes for the minimal local API plus read-only report/UI files."""
 
@@ -1422,6 +2195,10 @@ class Handler(BaseHTTPRequestHandler):
     @property
     def game_views(self):
         return self.server.game_views
+
+    @property
+    def previews(self):
+        return self.server.previews
 
     @property
     def upload_limiter(self):
@@ -1511,6 +2288,46 @@ class Handler(BaseHTTPRequestHandler):
                 return self.error(500, "report_unavailable",
                                   "The stored report index could not be read.")
             return self.json(200, payload)
+        if rest == "/frames":
+            query = parse_qs(urlsplit(self.path).query)
+            player = (query.get("player") or [""])[0]
+            try:
+                payload = self.previews.frames(job_id, player)
+            except PreviewError as error:
+                return self.error(error.status, error.code, error.message)
+            return self.json(200, payload)
+        if rest == "/explanations/prepare":
+            query = parse_qs(urlsplit(self.path).query)
+            player = (query.get("player") or [""])[0]
+            try:
+                payload = self.heatmaps.prepare_status(job_id, player)
+            except HeatmapRequestError as error:
+                return self.error(error.status, error.code, error.message)
+            return self.json(200, payload)
+        if rest == "/preview":
+            query = parse_qs(urlsplit(self.path).query)
+            player = (query.get("player") or [""])[0]
+            frame = (query.get("frame") or [""])[0]
+            cutoff = (query.get("cutoff") or [""])[0]
+            try:
+                if frame != "":
+                    payload = self.previews.lookup_frame(job_id, player, frame)
+                else:
+                    payload = self.previews.lookup(job_id, player, cutoff)
+            except PreviewError as error:
+                return self.error(error.status, error.code, error.message)
+            return self.json(200, payload)
+        preview_image = re.match(r"^/preview/(?P<name>[^/]+)$", rest)
+        if preview_image:
+            name = unquote(preview_image.group("name"))
+            try:
+                if FRAME_NAME_PATTERN.match(name):
+                    data = self.previews.frame_image(job_id, name)
+                else:
+                    data = self.previews.image(job_id, name)
+            except PreviewError as error:
+                return self.error(error.status, error.code, error.message)
+            return self._send(200, data, "image/png")
         heatmap_match = re.match(r"^/heatmaps/(?P<heatmap>[^/]+)$", rest)
         if heatmap_match:
             try:
@@ -1613,6 +2430,21 @@ class Handler(BaseHTTPRequestHandler):
                 LOG.exception("POST %s failed", self.path)
                 self.error(500, "internal_error", "The game-view request could not be processed.")
             return
+        prepare_match = re.match(r"^/api/jobs/(?P<job>[^/]+)/explanations/prepare$", path)
+        if prepare_match:
+            try:
+                self._handle_prepare_request(prepare_match.group("job"))
+            except HeatmapRequestError as error:
+                self.error(error.status, error.code, error.message)
+            except JobNotFound:
+                self.error(404, "job_not_found", "Unknown job id")
+            except (BrokenPipeError, ConnectionResetError):
+                self.close_connection = True
+            except Exception:  # noqa: BLE001
+                LOG.exception("POST %s failed", self.path)
+                self.error(500, "internal_error",
+                           "The explanation preparation request could not be processed.")
+            return
         heatmap_match = re.match(r"^/api/jobs/(?P<job>[^/]+)/heatmaps$", path)
         if heatmap_match:
             try:
@@ -1676,6 +2508,39 @@ class Handler(BaseHTTPRequestHandler):
             raise HeatmapRequestError(400, "invalid_cutoff", "cutoff_seconds must be a number.")
         payload, status = self.heatmaps.request(job_id, player, float(cutoff))
         self.json(status, payload)
+
+    def _handle_prepare_request(self, job_id):
+        if not JOB_ID_PATTERN.match(job_id):
+            raise JobNotFound(job_id)
+        content_type = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if content_type != "application/json":
+            raise HeatmapRequestError(400, "unsupported_content_type",
+                                      "Send application/json with player.")
+        length_header = self.headers.get("Content-Length")
+        if not length_header:
+            raise HeatmapRequestError(411, "length_required", "Send Content-Length.")
+        try:
+            length = int(length_header)
+        except ValueError:
+            raise HeatmapRequestError(400, "invalid_length", "Content-Length is not an integer.")
+        if length <= 0:
+            raise HeatmapRequestError(400, "empty_body", "The request body is empty.")
+        if length > HEATMAP_REQUEST_LIMIT:
+            raise HeatmapRequestError(413, "request_too_large",
+                                      f"JSON body exceeds {HEATMAP_REQUEST_LIMIT} bytes.")
+        try:
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            raise HeatmapRequestError(400, "invalid_json", "The JSON body is invalid.")
+        if not isinstance(body, dict):
+            raise HeatmapRequestError(400, "invalid_json", "The JSON body must be an object.")
+        if set(body) - {"player"}:
+            raise HeatmapRequestError(400, "invalid_request", "Only player is accepted.")
+        player = body.get("player")
+        if not isinstance(player, str) or not re.match(r"^player\d+$", player):
+            raise HeatmapRequestError(400, "invalid_player", "player must be playerN.")
+        payload = self.heatmaps.prepare(job_id, player)
+        self.json(202, payload)
 
     def _handle_game_view_request(self, job_id):
         if not JOB_ID_PATTERN.match(job_id):
@@ -1905,6 +2770,7 @@ def main(argv=None):
     manager = JobManager(config, store, slot, LOG)
     heatmaps = HeatmapManager(config, store, slot, LOG)
     game_views = GameViewManager(config, store, slot, LOG)
+    previews = PreviewManager(store, LOG)
     server = make_server(args.host, args.port)
     server.config = config
     server.store = store
@@ -1912,6 +2778,7 @@ def main(argv=None):
     server.manager = manager
     server.heatmaps = heatmaps
     server.game_views = game_views
+    server.previews = previews
     server.upload_limiter = (UploadRateLimiter(config.uploads_per_hour,
                                                config.rate_window_seconds)
                              if config.public_mode else None)

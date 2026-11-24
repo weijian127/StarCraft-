@@ -142,8 +142,8 @@
       <div class="moments-head">
         <h2 id="moments-heading">Suggested moments</h2>
         <div class="moment-nav" role="group" aria-label="Move between suggested moments">
-          <button type="button" id="moment-prev" class="button-secondary" disabled>Previous moment</button>
-          <button type="button" id="moment-next" class="button-secondary" disabled>Next moment</button>
+          <button type="button" id="moment-prev" class="button-secondary" aria-label="Previous moment" disabled>Previous moment</button>
+          <button type="button" id="moment-next" class="button-secondary" aria-label="Next moment" disabled>Next moment</button>
         </div>
       </div>
       <p class="note" id="moments-note">Large changes in model predictions; not confirmed causes of the result.</p>
@@ -153,6 +153,13 @@
       <div class="actions">
         <button type="button" id="intervals-toggle" class="button-secondary" hidden></button>
       </div>
+      <section class="prediction-times" id="prediction-times" aria-labelledby="prediction-times-heading">
+        <h3 class="prediction-times-title" id="prediction-times-heading">All prediction times</h3>
+        <div class="prediction-times-scroll" id="prediction-times-scroll" tabindex="0"
+             aria-labelledby="prediction-times-heading">
+          <ul class="prediction-times-list" id="prediction-times-list"></ul>
+        </div>
+      </section>
     </aside>
 
     <section class="card preview-panel" id="preview-panel" aria-labelledby="preview-heading">
@@ -171,26 +178,35 @@
         </div>
         <div class="preview-stage" id="preview-stage">
           <div class="preview-pane" id="pane-minimap" role="tabpanel" aria-labelledby="tab-minimap">
-            <section id="context-section" class="context-section" hidden>
-              <figure id="context-figure" class="context-map">
-                <div class="context-frame-wrap">
-                  <img id="context-image" alt="" tabindex="0" role="button">
-                  <div id="context-overlay" class="context-overlay" hidden></div>
-                </div>
-              </figure>
-              <ul class="legend context-legend" aria-label="Minimap feature legend">
-                <li><span class="legend-swatch swatch-self"></span> self</li>
-                <li><span class="legend-swatch swatch-neutral"></span> Neutral objects</li>
-                <li><span class="legend-swatch swatch-enemy"></span> enemy</li>
-                <li><span class="legend-swatch swatch-hidden"></span> hidden</li>
-                <li><span class="legend-swatch swatch-seen"></span> seen</li>
-                <li><span class="legend-swatch swatch-visible"></span> visible</li>
-              </ul>
-              <div class="actions">
-                <button type="button" id="peak-toggle" class="button-secondary" hidden>Show highest Grad-CAM region</button>
+            <figure id="frame-figure" class="context-map" hidden>
+              <div class="context-frame-wrap">
+                <img id="frame-image" alt="" tabindex="0" role="button" decoding="async">
               </div>
-            </section>
-            <p class="empty" id="context-empty" hidden></p>
+            </figure>
+            <p class="empty" id="frame-empty" hidden></p>
+            <p class="error" id="frame-error" role="alert" hidden></p>
+            <p class="note" id="frame-caption"></p>
+            <ul class="legend context-legend" id="frame-legend" aria-label="Minimap feature legend" hidden>
+              <li><span class="legend-swatch swatch-self"></span> self</li>
+              <li><span class="legend-swatch swatch-neutral"></span> Neutral objects</li>
+              <li><span class="legend-swatch swatch-enemy"></span> enemy</li>
+              <li><span class="legend-swatch swatch-hidden"></span> hidden</li>
+              <li><span class="legend-swatch swatch-seen"></span> seen</li>
+              <li><span class="legend-swatch swatch-visible"></span> visible</li>
+            </ul>
+            <div class="frame-scrub" id="frame-scrub" hidden>
+              <div class="frame-scrub-row">
+                <span class="frame-scrub-start" id="frame-start">0:00</span>
+                <input type="range" id="frame-slider" min="0" max="0" step="1" value="0"
+                       aria-label="Replay minimap observation time">
+                <span class="frame-scrub-end" id="frame-end">0:00</span>
+              </div>
+              <p class="frame-scrub-readout">
+                <span class="frame-scrub-current">Browsing <span id="frame-browse-time">&mdash;</span> &middot; observation <span id="frame-browse-index">&mdash;</span></span>
+                <span class="frame-scrub-displayed">Showing <span id="frame-shown-time">&mdash;</span> &middot; observation <span id="frame-shown-index">&mdash;</span></span>
+                <span class="frame-scrub-prob" id="frame-prob"></span>
+              </p>
+            </div>
           </div>
           <div class="preview-pane" id="pane-game" role="tabpanel" aria-labelledby="tab-game" hidden>
             <section id="game-view-block" class="game-view-block" hidden>
@@ -220,6 +236,27 @@
                 <button type="button" id="heatmap-retry" class="button-secondary" hidden>Retry heatmap</button>
               </div>
             </div>
+            <section id="context-section" class="context-section" hidden>
+              <h4>Model-input context minimap</h4>
+              <figure id="context-figure" class="context-map">
+                <div class="context-frame-wrap">
+                  <img id="context-image" alt="" tabindex="0" role="button">
+                  <div id="context-overlay" class="context-overlay" hidden></div>
+                </div>
+              </figure>
+              <ul class="legend context-legend" aria-label="Model-input minimap legend">
+                <li><span class="legend-swatch swatch-self"></span> self</li>
+                <li><span class="legend-swatch swatch-neutral"></span> Neutral objects</li>
+                <li><span class="legend-swatch swatch-enemy"></span> enemy</li>
+                <li><span class="legend-swatch swatch-hidden"></span> hidden</li>
+                <li><span class="legend-swatch swatch-seen"></span> seen</li>
+                <li><span class="legend-swatch swatch-visible"></span> visible</li>
+              </ul>
+              <div class="actions">
+                <button type="button" id="peak-toggle" class="button-secondary" hidden>Show highest Grad-CAM region</button>
+              </div>
+            </section>
+            <p class="empty" id="context-empty" hidden></p>
           </div>
         </div>
       </div>
@@ -248,6 +285,8 @@
           <div><dt>Training-set membership</dt><dd id="tech-membership">&mdash;</dd></div>
           <div><dt>Engine</dt><dd id="tech-engine">&mdash;</dd></div>
           <div><dt>Label definition</dt><dd id="tech-label">&mdash;</dd></div>
+          <div><dt>Prediction reference frame</dt><dd id="tech-reference">&mdash;</dd></div>
+          <div><dt>Replay minimap frame</dt><dd id="tech-browse">&mdash;</dd></div>
         </dl>
         <p class="note warn" id="run-override-note" hidden></p>
         <p class="note" id="run-limitations-note"></p>
@@ -260,8 +299,9 @@
         <summary>Grad-CAM details and interpretation</summary>
         <p class="note" id="heatmap-status"></p>
         <dl class="meta-grid">
-          <div><dt>Prediction cutoff</dt><dd id="hm-cutoff">&mdash;</dd></div>
+          <div><dt>Explanation cutoff</dt><dd id="hm-cutoff">&mdash;</dd></div>
           <div><dt>Image observation time (export field)</dt><dd id="hm-observed">&mdash;</dd></div>
+          <div><dt>Heatmap probability</dt><dd id="hm-probability">&mdash;</dd></div>
           <div><dt>Sampled history used by Grad-CAM</dt><dd id="hm-sampling">&mdash;</dd></div>
           <div><dt>Evidence supports</dt><dd id="hm-target">&mdash;</dd></div>
           <div><dt>Heatmap file</dt><dd id="hm-file" class="mono">&mdash;</dd></div>

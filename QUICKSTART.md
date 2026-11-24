@@ -117,10 +117,12 @@ is separate and can keep running; it only serves files and is not used for uploa
    with capped increasing delays, and can be retried manually without uploading again.
 5. The report opens automatically when the job completes. Use the POV buttons to
    switch player perspectives; the curve, selected point and Grad-CAM heatmap reload.
-   Selecting a saved point without a heatmap offers **Generate heatmap**; it reuses the
-   job's saved observations and original checkpoint and does not rerun the analysis.
-   The report also shows a model-input minimap reference and can optionally render one
-   cached RGB "Re-rendered game view" at the saved context game loop.
+   Opening a POV prepares up to three candidate-interval heatmaps in the background;
+   the Grad-CAM pane uses the exact requested time and offers **Generate heatmap at
+   [time]** for a cache miss. Moving the minimap slider never starts inference. Every
+   request reuses the job's saved observations and original checkpoint and does not
+   rerun the analysis. The report also shows a model-input minimap reference and can
+   optionally render one cached RGB "Re-rendered game view" at the saved context game loop.
 6. Keep the job id in the URL (`?job=...&pov=player2`) to return to the same report
    after a refresh.
 
